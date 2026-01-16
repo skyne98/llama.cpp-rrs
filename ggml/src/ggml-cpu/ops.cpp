@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "rrs.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -664,6 +665,8 @@ void ggml_compute_forward_add(
                 ggml_compute_forward_add_non_quantized(params, dst);
             } break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -1112,6 +1115,8 @@ void ggml_compute_forward_add1(
                 }
             } break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -1240,6 +1245,8 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4264,6 +4271,8 @@ void ggml_compute_forward_out_prod(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4538,6 +4547,8 @@ void ggml_compute_forward_set(
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4760,6 +4771,22 @@ void ggml_compute_forward_get_rows(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
+            {
+                ggml_compute_forward_get_rows_q(params, dst);
+            } break;
+        case GGML_TYPE_Q4_0_RRS:
+            {
+                ggml_compute_forward_get_rows_q(params, dst);
+                int64_t ne0 = dst->ne[0];
+                int64_t ne1 = dst->ne[1];
+                float * data = (float *) dst->data;
+                if (ne0 > 0 && (ne0 & (ne0 - 1)) == 0) {
+                    for (int64_t i = 0; i < ne1; ++i) {
+                        ggml_fwht_impl(data + i * ne0, (int)ne0);
+                    }
+                }
+            } break;
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -5484,6 +5511,8 @@ void ggml_compute_forward_clamp(
             } break;
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_0_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
