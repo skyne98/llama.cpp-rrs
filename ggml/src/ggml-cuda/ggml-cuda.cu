@@ -2147,6 +2147,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // RRS types use their own GEMM path, not MMVQ
+    if (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2199,10 +2204,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    // RRS types already handled above, exclude from MMVQ/MMQ paths
+    bool is_rrs_type = (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT);
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_rrs_type
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_rrs_type
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -2284,14 +2291,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // RRS types use their own GEMM path
+    const bool is_rrs_type = (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT);
+
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ne2 == 1) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_is_quantized(src0->type) && !is_rrs_type) {
                 ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-            } else {
+            } else if (!is_rrs_type) {
                 ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
             }
-            return;
+            // RRS types fall through to cublas path below
+            if (!is_rrs_type) {
+                return;
+            }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
@@ -4442,6 +4455,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_K_RRS:
                         return true;
                     default:
                         return false;

@@ -1,6 +1,7 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "rrs.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -199,6 +200,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        // Note: Q4_K_RRS is handled separately in get_rows_cuda() below
         default:
             // TODO: k-quants
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
@@ -212,6 +214,20 @@ void get_rows_cuda(
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream) {
+    // Handle Q4_K_RRS specially - requires float output and inverse FWHT
+    if (src0_type == GGML_TYPE_Q4_K_RRS) {
+        GGML_ASSERT(dst_type == GGML_TYPE_F32 && "Q4_K_RRS GET_ROWS requires F32 destination");
+        // Dequantize using Q4_0 path (Q4_K_RRS stores quants similarly)
+        get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, (float*)dst_d,
+            ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        // Apply inverse FWHT to convert from Hadamard domain back to spatial domain
+        // FWHT is self-inverse (with proper scaling)
+        if (ne10 > 0) {
+            ggml_cuda_rrs_fwht((float*)dst_d, (float*)dst_d, ne00, ne10, stream);
+        }
+        return;
+    }
+    
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,

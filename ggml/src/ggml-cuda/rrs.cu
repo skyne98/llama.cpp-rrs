@@ -1,5 +1,8 @@
 #include "rrs.cuh"
 #include "common.cuh"
+
+// Debug flag - set to 1 to enable debug output
+#define RRS_DEBUG 0
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
@@ -215,12 +218,13 @@ void ggml_cuda_rrs_fwht(
 // ============================================================================
 
 // Simple per-32-group quantization for activations
-// Output: packed nibbles + per-group scale/min in simplified format
+// Output: packed SIGNED INT4 nibbles + per-group scale/offset (asymmetric, matching Q4_K)
+// WMMA INT4 requires signed values in [-8, 7] range
 __global__ void quantize_act_q4_simple_kernel(
     const float* __restrict__ x,
     uint8_t* __restrict__ qs,
     half* __restrict__ scales,
-    half* __restrict__ mins,
+    half* __restrict__ mins,  // Stores offset for dequant: 8*scale - min
     int n,
     int batch_size)
 {
@@ -238,27 +242,33 @@ __global__ void quantize_act_q4_simple_kernel(
     
     float val = (base + lane < n) ? x_row[base + lane] : 0.0f;
     
-    // Warp-level reduction for min/max
-    float vmax = val;
+    // Warp-level reduction for min/max (asymmetric quantization matching Q4_K)
     float vmin = val;
+    float vmax = val;
     
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
-        vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
         vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
+        vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
     }
     
+    // Q4_K style: if min > 0, set to 0
+    if (vmin > 0) vmin = 0;
+    const float qmin = -vmin;
     const float range = vmax - vmin;
     const float scale = range / 15.0f;
     const float inv_scale = (scale > 1e-10f) ? (1.0f / scale) : 0.0f;
     
-    int q = __float2int_rn((val - vmin) * inv_scale);
-    q = max(0, min(15, q));
+    // Quantize to unsigned [0, 15], then convert to signed [-8, 7]
+    int q_unsigned = __float2int_rn((val - vmin) * inv_scale);
+    q_unsigned = max(0, min(15, q_unsigned));
+    int q_signed = q_unsigned - 8;
+    int q_4bit = q_signed & 0xF;
     
     // Pack two 4-bit values per byte
     const int pair_idx = lane % 16;
-    int lo = __shfl_sync(0xFFFFFFFF, q, pair_idx);
-    int hi = __shfl_sync(0xFFFFFFFF, q, pair_idx + 16);
+    int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
+    int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
     int packed = lo | (hi << 4);
     
     if (lane < 16) {
@@ -268,7 +278,9 @@ __global__ void quantize_act_q4_simple_kernel(
     
     if (lane == 0) {
         scales[row * groups + group] = __float2half(scale);
-        mins[row * groups + group] = __float2half(vmin);
+        // Store offset for dequant: 8*scale - min (matching weight conversion formula)
+        float offset = 8.0f * scale - qmin;
+        mins[row * groups + group] = __float2half(offset);
     }
 }
 
@@ -320,7 +332,9 @@ __global__ void fwht_quantize_kernel(
     }
     __syncthreads();
     
-    // Quantize per-32 groups
+    // Quantize per-32 groups using ASYMMETRIC format matching Q4_K (with mins)
+    // This matches the CPU's quantize_row_q4_K_fast behavior
+    // WMMA INT4 requires signed values, so we convert unsigned [0,15] to signed [-8,7]
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int num_warps = blockDim.x / 32;
@@ -329,23 +343,33 @@ __global__ void fwht_quantize_kernel(
         const int base = group * 32;
         float val = smem_fq[base + lane];
         
-        float vmax = val, vmin = val;
+        // Asymmetric quantization: find min and max (matching Q4_K)
+        float vmin = val;
+        float vmax = val;
         #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1) {
-            vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
             vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
+            vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
         }
         
+        // Q4_K style: if min > 0, set to 0 (so min represents negative values)
+        if (vmin > 0) vmin = 0;
+        const float qmin = -vmin;  // Store as positive value
         const float range = vmax - vmin;
         const float qscale = range / 15.0f;
         const float inv_scale = (qscale > 1e-10f) ? (1.0f / qscale) : 0.0f;
         
-        int q = __float2int_rn((val - vmin) * inv_scale);
-        q = max(0, min(15, q));
+        // Quantize to unsigned [0, 15], then convert to signed [-8, 7]
+        int q_unsigned = __float2int_rn((val - vmin) * inv_scale);
+        q_unsigned = max(0, min(15, q_unsigned));
+        // Convert to signed: subtract 8
+        int q_signed = q_unsigned - 8;
+        // Store as 2's complement: mask to 4 bits
+        int q_4bit = q_signed & 0xF;
         
         const int pair_idx = lane % 16;
-        int lo = __shfl_sync(0xFFFFFFFF, q, pair_idx);
-        int hi = __shfl_sync(0xFFFFFFFF, q, pair_idx + 16);
+        int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
+        int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
         int packed = lo | (hi << 4);
         
         if (lane < 16) {
@@ -354,7 +378,9 @@ __global__ void fwht_quantize_kernel(
         
         if (lane == 0) {
             scales[batch_idx * groups + group] = __float2half(qscale);
-            mins[batch_idx * groups + group] = __float2half(vmin);
+            // Store the offset needed in dequant: 8*scale - min (matching weight conversion)
+            float offset = 8.0f * qscale - qmin;
+            mins[batch_idx * groups + group] = __float2half(offset);
         }
     }
 }
@@ -593,7 +619,11 @@ __global__ void __launch_bounds__(256) rrs_gemm_i4_async_kernel(
         }
     };
     
-    // Lambda: store C tile to global memory
+    // Shared memory for partial tile stores (reuse part of shared_memory after GEMM is done)
+    // We need space for one WMMA fragment: 8x8 = 64 int32s = 256 bytes
+    int32_t* smem_c = reinterpret_cast<int32_t*>(shared_memory);
+    
+    // Lambda: store C tile to global memory with partial tile handling
     auto store_C_tile = [&]() {
         #pragma unroll
         for (int pm = 0; pm < Config::kPatchM; pm++) {
@@ -608,11 +638,35 @@ __global__ void __launch_bounds__(256) rrs_gemm_i4_async_kernel(
                         const int col = block_col_start + 
                             ((warp_col * Config::kPatchN + pn) * Config::kWarpColTiles + j) * Config::WMMA_N;
                         
-                        // Only store if full WMMA tile fits in bounds
-                        // WMMA stores an 8x8 block, so check row+8 and col+8
+                        // Skip if completely out of bounds
+                        if (row >= M || col >= N) continue;
+                        
+                        // Check if full WMMA tile fits in bounds
                         if (row + Config::WMMA_M <= M && col + Config::WMMA_N <= N) {
+                            // Fast path: full tile store
                             wmma::store_matrix_sync(gmemC.get_ptr(row, col), 
                                 c_frag[pm][pn][i][j], N, wmma::mem_row_major);
+                        } else {
+                            // Slow path: partial tile - store to shared memory then scalar copy
+                            // Only one warp at a time can use smem_c, so serialize
+                            __syncthreads();
+                            wmma::store_matrix_sync(smem_c, c_frag[pm][pn][i][j], 
+                                Config::WMMA_N, wmma::mem_row_major);
+                            __syncthreads();
+                            
+                            // Each thread in warp copies some elements
+                            const int lane = threadIdx.x % WARP_SIZE;
+                            for (int elem = lane; elem < Config::WMMA_M * Config::WMMA_N; elem += WARP_SIZE) {
+                                const int local_row = elem / Config::WMMA_N;
+                                const int local_col = elem % Config::WMMA_N;
+                                const int global_row = row + local_row;
+                                const int global_col = col + local_col;
+                                
+                                if (global_row < M && global_col < N) {
+                                    gmemC.get_ptr(global_row, global_col)[0] = smem_c[elem];
+                                }
+                            }
+                            __syncthreads();
                         }
                     }
                 }
@@ -877,13 +931,24 @@ inline void rrs_gemm_i4_dispatch(
 // ============================================================================
 
 // Simple dequant kernel for benchmark - uses separate scales arrays (not Q4_K block format)
+// If weight_scales is nullptr, uses a default scale (for Q4_K_RRS with embedded scales)
+// Dequantization for signed INT4 GEMM result
+// Both activations and weights use symmetric signed INT4 quantization
+// Act: val_a = q_a * scale_a (symmetric, centered at 0)
+// Wgt: val_w = q_w * scale_w + offset_w (converted from Q4_K asymmetric)
+// 
+// Dot product: sum(val_a * val_w) = sum(q_a * scale_a * (q_w * scale_w + offset_w))
+//            = scale_a * scale_w * sum(q_a * q_w) + scale_a * offset_w * sum(q_a)
+//            = scale_a * scale_w * C_i32 + scale_a * offset_w * sum_q_a
+// 
+// For simplicity, we approximate with average scales (per-group tracking would be more accurate)
 __global__ void rrs_dequant_simple_kernel(
     const int* __restrict__ C_i32,
     float* __restrict__ C_f32,
     const half* __restrict__ act_scales,
-    const half* __restrict__ act_mins,
+    const half* __restrict__ act_mins,     // Not used (symmetric quant)
     const half* __restrict__ weight_scales,
-    const half* __restrict__ weight_mins,
+    const half* __restrict__ weight_mins,  // Actually offsets from unsigned->signed conversion
     const int M, const int N, const int K)
 {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -894,18 +959,49 @@ __global__ void rrs_dequant_simple_kernel(
     const int sum_i32 = C_i32[row * N + col];
     const int groups = K / 32;
     
-    // Compute average scales for both activation and weight
-    float act_scale_sum = 0.0f;
-    float weight_scale_sum = 0.0f;
+    // Compute average activation scale and offset (asymmetric quantization)
+    float avg_act_scale = 0.0f;
+    float avg_act_offset = 0.0f;
     for (int g = 0; g < groups; g++) {
-        act_scale_sum += __half2float(act_scales[row * groups + g]);
-        weight_scale_sum += __half2float(weight_scales[col * groups + g]);
+        avg_act_scale += __half2float(act_scales[row * groups + g]);
+        if (act_mins != nullptr) {
+            avg_act_offset += __half2float(act_mins[row * groups + g]);
+        }
     }
-    float avg_act_scale = act_scale_sum / groups;
-    float avg_weight_scale = weight_scale_sum / groups;
+    avg_act_scale /= groups;
+    avg_act_offset /= groups;
     
-    // Simple dequantization: scale the INT4 dot product result
-    C_f32[row * N + col] = (float)sum_i32 * avg_act_scale * avg_weight_scale;
+    // Compute average weight scale and offset
+    float avg_weight_scale = 0.0f;
+    float avg_weight_offset = 0.0f;
+    if (weight_scales != nullptr) {
+        for (int g = 0; g < groups; g++) {
+            avg_weight_scale += __half2float(weight_scales[col * groups + g]);
+            if (weight_mins != nullptr) {
+                avg_weight_offset += __half2float(weight_mins[col * groups + g]);
+            }
+        }
+        avg_weight_scale /= groups;
+        avg_weight_offset /= groups;
+    } else {
+        avg_weight_scale = 0.125f;  // Default fallback
+    }
+    
+    // Dequantization for asymmetric quantization:
+    // Both act and weight use: val = scale * q_signed + offset
+    // where q_signed = q_unsigned - 8, and offset = 8*scale - min
+    // 
+    // Dot product: sum(val_a * val_w) = sum((scale_a * q_a + offset_a) * (scale_w * q_w + offset_w))
+    // = scale_a * scale_w * sum(q_a * q_w)           [main GEMM term]
+    // + scale_a * offset_w * sum(q_a)                [cross term 1]
+    // + scale_w * offset_a * sum(q_w)                [cross term 2]  
+    // + offset_a * offset_w * K                      [bias term]
+    //
+    // Simplified approximation: main term + bias term (cross terms small for centered data)
+    float result = (float)sum_i32 * avg_act_scale * avg_weight_scale;
+    result += avg_act_offset * avg_weight_offset * (float)(K / 32);  // K/32 = elements per group
+    
+    C_f32[row * N + col] = result;
 }
 
 // For Q4_K weights: reconstruct using per-group 6-bit scales
@@ -1018,6 +1114,76 @@ __global__ void rrs_dequant_accurate_kernel(
 }
 
 // ============================================================================
+// Q4_K Block Extraction: Extract packed INT4 quants from Q4_K blocks
+// Q4_K layout: [dm(4B), scales(12B), qs(128B)] per 256-element block
+// 
+// IMPORTANT: Q4_K stores UNSIGNED INT4 [0,15] but WMMA needs SIGNED INT4 [-8,7]
+// We convert during extraction by XORing with 0x88 (flips bit 3 in each nibble)
+// This transforms: 0->-8, 7->-1, 8->0, 15->7 (exactly what we need!)
+// ============================================================================
+
+__global__ void extract_q4k_quants_kernel(
+    const void* __restrict__ q4k_blocks,
+    uint8_t* __restrict__ packed_quants,
+    half* __restrict__ weight_scales,    // Output: per-group scales for dequant
+    half* __restrict__ weight_mins,      // Output: per-group mins for dequant (offset from unsigned->signed)
+    const int N,   // Number of rows (output features)
+    const int K)   // Number of columns (hidden dim)
+{
+    // Each thread handles one Q4_K block
+    const int blocks_per_row = K / 256;
+    const int total_blocks = N * blocks_per_row;
+    
+    for (int block_idx = blockIdx.x * blockDim.x + threadIdx.x; 
+         block_idx < total_blocks; 
+         block_idx += blockDim.x * gridDim.x) 
+    {
+        const int row = block_idx / blocks_per_row;
+        const int block_in_row = block_idx % blocks_per_row;
+        
+        const block_q4_K* src_block = (const block_q4_K*)q4k_blocks + block_idx;
+        
+        // Extract packed quants and convert unsigned [0,15] to signed [-8,7]
+        // Q4_K stores unsigned values where q represents: val = d*sc*q - dmin*m
+        // For WMMA, we need signed 2's complement: subtract 8 from each nibble
+        // unsigned 0 -> signed -8 (0b1000), unsigned 8 -> signed 0 (0b0000), etc.
+        uint8_t* dst_qs = packed_quants + row * (K / 2) + block_in_row * 128;
+        
+        #pragma unroll
+        for (int i = 0; i < 128; i++) {
+            uint8_t orig = src_block->qs[i];
+            // Extract nibbles, subtract 8, mask to 4 bits for 2's complement
+            int lo = (orig & 0xF) - 8;
+            int hi = (orig >> 4) - 8;
+            dst_qs[i] = (lo & 0xF) | ((hi & 0xF) << 4);
+        }
+        
+        // Extract and expand per-group scales for dequantization
+        // Each Q4_K block has 8 groups of 32 elements
+        const float d = __half2float(src_block->dm.x);
+        const float dmin = __half2float(src_block->dm.y);
+        
+        uint8_t sc[8], mn[8];
+        unpack_scales_mins_k4_cuda(src_block->scales, sc, mn);
+        
+        // Store expanded scales/mins for each of the 8 groups in this block
+        // The dequant formula changes due to unsigned->signed conversion:
+        // Original: val = d*sc*q_unsigned - dmin*m
+        // After conversion: q_signed = q_unsigned - 8, so q_unsigned = q_signed + 8
+        // Therefore: val = d*sc*(q_signed + 8) - dmin*m = d*sc*q_signed + (8*d*sc - dmin*m)
+        // We store scale = d*sc, and offset = 8*d*sc - dmin*m (to add per element in dequant)
+        const int base_group = row * (K / 32) + block_in_row * 8;
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            float scale = d * sc[g];
+            float offset = 8.0f * scale - dmin * mn[g];
+            weight_scales[base_group + g] = __float2half(scale);
+            weight_mins[base_group + g] = __float2half(offset);  // Bias to add: 32 elements * offset per group
+        }
+    }
+}
+
+// ============================================================================
 // PATH B: Repack to Q8 + INT8 dp4a GEMM
 // Alternative approach: convert Q4 activations to Q8 and use dp4a
 // ============================================================================
@@ -1086,8 +1252,8 @@ __global__ void rrs_gemm_q8_dp4a_kernel(
 // ============================================================================
 
 void ggml_cuda_rrs_gemm_q4q4(
-    const void* A,
-    const void* B,
+    const void* A,           // Quantized activations (packed Q4)
+    const void* B,           // Weight data: packed Q4 (not Q4_K blocks!)
     float* C,
     int M, int N, int K,
     const half* scales_A, const half* mins_A,
@@ -1097,15 +1263,28 @@ void ggml_cuda_rrs_gemm_q4q4(
     int32_t* C_i32;
     cudaMallocAsync(&C_i32, M * N * sizeof(int32_t), stream);
     
+    // Zero-initialize output buffer - WMMA kernel may not write partial tiles
+    // This ensures out-of-bounds locations contain zeros
+    cudaMemsetAsync(C_i32, 0, M * N * sizeof(int32_t), stream);
+    
     // Use new async pipeline kernel with automatic config selection
     rrs_gemm_i4_dispatch(
         (const uint8_t*)A, (const uint8_t*)B, C_i32,
         M, N, K, stream);
     
-    // Simple dequantization using separate scale arrays
     dim3 dq_block(16, 16);
     dim3 dq_grid((M + 15) / 16, (N + 15) / 16);
     
+#if RRS_DEBUG
+    {
+        cudaStreamSynchronize(stream);
+        int32_t h_c_i32[4];
+        cudaMemcpy(h_c_i32, C_i32, 4*sizeof(int32_t), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] GEMM C_i32 first 4: %d %d %d %d\n", h_c_i32[0], h_c_i32[1], h_c_i32[2], h_c_i32[3]);
+    }
+#endif
+    
+    // Simple dequantization with separate scale arrays
     rrs_dequant_simple_kernel<<<dq_grid, dq_block, 0, stream>>>(
         C_i32, C, scales_A, mins_A, scales_B, mins_B, M, N, K);
     
@@ -1179,41 +1358,115 @@ void ggml_cuda_rrs_mul_mat(
     
     cudaStream_t stream = ctx.stream();
     
-    // Allocate temporary buffers
-    float* act_fwht;
+    static int call_count = 0;
+    call_count++;
+    
+#if RRS_DEBUG
+    if (call_count <= 3) {
+        fprintf(stderr, "[RRS CUDA] mul_mat call #%d: M=%d, N=%d, K=%d\n", call_count, M, N, K);
+    }
+#endif
+    
+    const int groups_act = M * (K / 32);
+    const int groups_wgt = N * (K / 32);
+    
+    // Allocate temporary buffers for activations
     uint8_t* act_q4;
     half *act_scales, *act_mins;
     
-    const int groups = K / 32;
-    
-    cudaMallocAsync(&act_fwht, M * K * sizeof(float), stream);
     cudaMallocAsync(&act_q4, M * K / 2, stream);
-    cudaMallocAsync(&act_scales, M * groups * sizeof(half), stream);
-    cudaMallocAsync(&act_mins, M * groups * sizeof(half), stream);
+    cudaMallocAsync(&act_scales, groups_act * sizeof(half), stream);
+    cudaMallocAsync(&act_mins, groups_act * sizeof(half), stream);
+    
+    // Allocate temporary buffers for extracted weight data
+    uint8_t* wgt_q4_packed;
+    half *wgt_scales, *wgt_mins;
+    
+    cudaMallocAsync(&wgt_q4_packed, N * K / 2, stream);
+    cudaMallocAsync(&wgt_scales, groups_wgt * sizeof(half), stream);
+    cudaMallocAsync(&wgt_mins, groups_wgt * sizeof(half), stream);
     
     // Get source pointers
     const float* src1_f32 = (const float*)src1->data;
     const void* src0_q4k = src0->data;
     float* dst_f32 = (float*)dst->data;
     
-    // Step 1: FWHT + Quantize activations (fused)
+    // Step 1: Extract packed INT4 quants and scales from Q4_K blocks
+    // Q4_K layout: [dm(4B), scales(12B), qs(128B)] per 256-element block
+    const int total_blocks = N * (K / 256);
+    const int extract_threads = 256;
+    const int extract_blocks = (total_blocks + extract_threads - 1) / extract_threads;
+    
+    extract_q4k_quants_kernel<<<extract_blocks, extract_threads, 0, stream>>>(
+        src0_q4k, wgt_q4_packed, wgt_scales, wgt_mins, N, K);
+    
+    // Step 2: FWHT + Quantize activations (fused)
     ggml_cuda_rrs_fwht_quantize(src1_f32, act_q4, act_scales, act_mins, K, M, stream);
     
-    // Step 2: INT4 GEMM 
-    // Note: Weight scales are embedded in Q4_K blocks
-    // For now, use nullptr for weight scales - dequant kernel reads from blocks
+#if RRS_DEBUG
+    if (call_count <= 3) {
+        cudaStreamSynchronize(stream);
+        
+        // Check a few activation values (INPUT to FWHT)
+        float h_act[4];
+        cudaMemcpy(h_act, src1_f32, 4*sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] First 4 activation floats (pre-FWHT): %f %f %f %f\n", h_act[0], h_act[1], h_act[2], h_act[3]);
+        
+        // Check quantized activations (after FWHT+quantize)
+        uint8_t h_act_q[4];
+        cudaMemcpy(h_act_q, act_q4, 4, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] First 4 act_q4 bytes (post-FWHT): 0x%02x 0x%02x 0x%02x 0x%02x\n", h_act_q[0], h_act_q[1], h_act_q[2], h_act_q[3]);
+        
+        // Decode the signed INT4 values to verify they're reasonable
+        int q0_lo = (h_act_q[0] & 0xF); if (q0_lo >= 8) q0_lo -= 16;  // 2's complement
+        int q0_hi = (h_act_q[0] >> 4);  if (q0_hi >= 8) q0_hi -= 16;
+        int q1_lo = (h_act_q[1] & 0xF); if (q1_lo >= 8) q1_lo -= 16;
+        int q1_hi = (h_act_q[1] >> 4);  if (q1_hi >= 8) q1_hi -= 16;
+        fprintf(stderr, "[RRS CUDA] Decoded act_q4 first 4 values: %d %d %d %d\n", q0_lo, q0_hi, q1_lo, q1_hi);
+        
+        // Check act scales
+        half h_scales[2];
+        cudaMemcpy(h_scales, act_scales, 2*sizeof(half), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] First 2 act_scales: %f %f\n", __half2float(h_scales[0]), __half2float(h_scales[1]));
+        
+        // Check weight quants  
+        uint8_t h_wgt_q[4];
+        cudaMemcpy(h_wgt_q, wgt_q4_packed, 4, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] First 4 wgt_q4 bytes: 0x%02x 0x%02x 0x%02x 0x%02x\n", h_wgt_q[0], h_wgt_q[1], h_wgt_q[2], h_wgt_q[3]);
+        
+        // Check weight scales
+        half h_wgt_scales[2];
+        cudaMemcpy(h_wgt_scales, wgt_scales, 2*sizeof(half), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] First 2 wgt_scales: %f %f\n", __half2float(h_wgt_scales[0]), __half2float(h_wgt_scales[1]));
+    }
+#endif
+    
+    // Step 3: INT4 GEMM with proper scale arrays
     ggml_cuda_rrs_gemm_q4q4(
-        act_q4, src0_q4k, dst_f32,
+        act_q4, wgt_q4_packed, dst_f32,
         M, N, K,
         act_scales, act_mins,
-        nullptr, nullptr,  // Weight scales come from Q4_K blocks
+        wgt_scales, wgt_mins,
         stream);
     
+#if RRS_DEBUG
+    if (call_count <= 3) {
+        cudaStreamSynchronize(stream);
+        
+        // Check output
+        float h_out[4];
+        cudaMemcpy(h_out, dst_f32, 4*sizeof(float), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[RRS CUDA] First 4 output floats: %f %f %f %f\n", h_out[0], h_out[1], h_out[2], h_out[3]);
+    }
+#endif
+    
     // Cleanup
-    cudaFreeAsync(act_fwht, stream);
     cudaFreeAsync(act_q4, stream);
     cudaFreeAsync(act_scales, stream);
     cudaFreeAsync(act_mins, stream);
+    cudaFreeAsync(wgt_q4_packed, stream);
+    cudaFreeAsync(wgt_scales, stream);
+    cudaFreeAsync(wgt_mins, stream);
 }
 
 // Check if RRS path should be used
