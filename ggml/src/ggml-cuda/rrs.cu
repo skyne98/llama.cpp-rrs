@@ -11,6 +11,16 @@
 using namespace nvcuda;
 
 // ============================================================================ 
+// GEMM Configuration
+// ============================================================================ 
+// Tile sizes for the optimized GEMM kernel
+#define TILE_M 32       // Output tile rows per block
+#define TILE_N 32       // Output tile cols per block  
+#define TILE_K 8        // K-blocks (256 elements each = 2048 elements) per iteration
+#define THREADS_PER_BLOCK 256
+#define M1_COLS_PER_BLOCK 4  // Number of output columns per block for M=1 fused kernel
+
+// ============================================================================ 
 // Shared Helpers
 // ============================================================================ 
 
@@ -230,51 +240,435 @@ void ggml_cuda_rrs_fwht_quantize(const float* x, void* y, int n, int batch_size,
 }
 
 // ============================================================================ 
-// GEMM Kernel (A=Q4_K, B=Q4_K)
+// GEMM Kernel (A=Q4_K, B=Q4_K) - Optimized with dp4a and tiling
 // ============================================================================ 
 
-__global__ void rrs_gemm_q4k_q4k_kernel(const void* __restrict__ A, const void* __restrict__ B, float* __restrict__ C, const int M, const int N, const int K) {
-    const int col = blockIdx.x; const int row = blockIdx.y;
-    if (col >= N || row >= M) return;
-    const int tid = threadIdx.x; const int n_threads = blockDim.x;
-    const block_q4_K* blocks_a = (const block_q4_K*)A + row * (K / 256);
-    const block_q4_K* blocks_w = (const block_q4_K*)B + col * (K / 256);
-    float total_sum = 0.0f;
-    for (int b = tid; b < K / 256; b += n_threads) {
-        const block_q4_K& ab = blocks_a[b]; const block_q4_K& wb = blocks_w[b];
-        const float d_a = __half2float(ab.dm.x); const float dmin_a = __half2float(ab.dm.y);
-        const float d_w = __half2float(wb.dm.x); const float dmin_w = __half2float(wb.dm.y);
-        uint8_t sc_a[8], mn_a[8], sc_w[8], mn_w[8];
-        unpack_scales_mins_k4_cuda(ab.scales, sc_a, mn_a); unpack_scales_mins_k4_cuda(wb.scales, sc_w, mn_w);
-        for (int g = 0; g < 8; g++) {
-            const int p = g / 2; const bool is_hi = (g % 2 != 0);
-            const uint8_t* qs_a_ptr = ab.qs + p * 32; const uint8_t* qs_w_ptr = wb.qs + p * 32;
-            int dot_qq = 0, sum_qa = 0, sum_qw = 0;
-            #pragma unroll
-            for (int l = 0; l < 16; l++) {
-                const uint8_t pa_0 = qs_a_ptr[l], pa_1 = qs_a_ptr[l+16];
-                const uint8_t pw_0 = qs_w_ptr[l], pw_1 = qs_w_ptr[l+16];
-                int qa0 = (int)(is_hi ? (pa_0 >> 4) : (pa_0 & 0x0F)), qa1 = (int)(is_hi ? (pa_1 >> 4) : (pa_1 & 0x0F));
-                int qw0 = (int)(is_hi ? (pw_0 >> 4) : (pw_0 & 0x0F)), qw1 = (int)(is_hi ? (pw_1 >> 4) : (pw_1 & 0x0F));
-                dot_qq += qa0 * qw0 + qa1 * qw1; sum_qa += qa0 + qa1; sum_qw += qw0 + qw1;
+// Compute dot product of one Q4_K block pair using dp4a
+// Returns the full dequantized dot product value
+__device__ __forceinline__ float q4k_block_dot(const block_q4_K& ab, const block_q4_K& wb) {
+    const float d_a = __half2float(ab.dm.x);
+    const float dmin_a = __half2float(ab.dm.y);
+    const float d_w = __half2float(wb.dm.x);
+    const float dmin_w = __half2float(wb.dm.y);
+    
+    uint8_t sc_a[8], mn_a[8], sc_w[8], mn_w[8];
+    unpack_scales_mins_k4_cuda(ab.scales, sc_a, mn_a);
+    unpack_scales_mins_k4_cuda(wb.scales, sc_w, mn_w);
+    
+    float total = 0.0f;
+    
+    // Process 4 chunks of 32 bytes each (128 bytes total = 256 4-bit values)
+    #pragma unroll
+    for (int chunk = 0; chunk < 4; chunk++) {
+        const int g_lo = chunk * 2;
+        const int g_hi = g_lo + 1;
+        
+        // Load 32 bytes = 8 int32s using vectorized loads
+        const int* qa_i32 = (const int*)(ab.qs + chunk * 32);
+        const int* qw_i32 = (const int*)(wb.qs + chunk * 32);
+        
+        int dot_lo = 0, dot_hi = 0;
+        int sum_a_lo = 0, sum_a_hi = 0;
+        int sum_w_lo = 0, sum_w_hi = 0;
+        
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int va = qa_i32[i];
+            const int vw = qw_i32[i];
+            
+            // Extract lo nibbles (mask with 0x0F0F0F0F)
+            const int va_lo = va & 0x0F0F0F0F;
+            const int vw_lo = vw & 0x0F0F0F0F;
+            // Extract hi nibbles (shift and mask)
+            const int va_hi = (va >> 4) & 0x0F0F0F0F;
+            const int vw_hi = (vw >> 4) & 0x0F0F0F0F;
+            
+            // dp4a: dot += a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
+            dot_lo = __dp4a(va_lo, vw_lo, dot_lo);
+            dot_hi = __dp4a(va_hi, vw_hi, dot_hi);
+            
+            // Sum of elements for min offset calculation
+            // dp4a with 0x01010101 sums the 4 bytes
+            sum_a_lo = __dp4a(va_lo, 0x01010101, sum_a_lo);
+            sum_a_hi = __dp4a(va_hi, 0x01010101, sum_a_hi);
+            sum_w_lo = __dp4a(vw_lo, 0x01010101, sum_w_lo);
+            sum_w_hi = __dp4a(vw_hi, 0x01010101, sum_w_hi);
+        }
+        
+        // Apply scales and accumulate
+        const int sc_a_lo = sc_a[g_lo], sc_a_hi = sc_a[g_hi];
+        const int sc_w_lo = sc_w[g_lo], sc_w_hi = sc_w[g_hi];
+        const int mn_a_lo = mn_a[g_lo], mn_a_hi = mn_a[g_hi];
+        const int mn_w_lo = mn_w[g_lo], mn_w_hi = mn_w[g_hi];
+        
+        // term1: d_a * d_w * sum(qa * qw * sca * scw)
+        total += (d_a * d_w) * (float)(dot_lo * sc_a_lo * sc_w_lo + dot_hi * sc_a_hi * sc_w_hi);
+        // term2: -d_a * dmin_w * sum(qa * sca * mnw)
+        total -= (d_a * dmin_w) * (float)(sum_a_lo * sc_a_lo * mn_w_lo + sum_a_hi * sc_a_hi * mn_w_hi);
+        // term3: -d_w * dmin_a * sum(qw * scw * mna)  
+        total -= (d_w * dmin_a) * (float)(sum_w_lo * sc_w_lo * mn_a_lo + sum_w_hi * sc_w_hi * mn_a_hi);
+        // term4: dmin_a * dmin_w * 32 * sum(mna * mnw)
+        total += (dmin_a * dmin_w) * 32.0f * (float)(mn_a_lo * mn_w_lo + mn_a_hi * mn_w_hi);
+    }
+    
+    return total;
+}
+
+// Tiled GEMM kernel: each block computes a TILE_M x TILE_N output tile
+// A is [M, K/256] Q4_K blocks (activations, row-major)
+// B is [N, K/256] Q4_K blocks (weights, row-major - each row is one output neuron)
+// C is [M, N] float output
+__global__ void rrs_gemm_q4k_q4k_tiled_kernel(
+    const void* __restrict__ A,
+    const void* __restrict__ B, 
+    float* __restrict__ C,
+    const int M, const int N, const int K
+) {
+    const int num_k_blocks = K / 256;
+    
+    // Block position in output
+    const int block_row = blockIdx.y * TILE_M;
+    const int block_col = blockIdx.x * TILE_N;
+    
+    // Thread position within block
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    
+    // Each thread computes one or more output elements
+    // With TILE_M=32, TILE_N=32, we have 1024 outputs per block
+    // With 256 threads, each thread computes 4 outputs
+    const int outputs_per_thread = (TILE_M * TILE_N) / THREADS_PER_BLOCK;
+    
+    // Register storage for partial sums
+    float acc[outputs_per_thread];
+    #pragma unroll
+    for (int i = 0; i < outputs_per_thread; i++) acc[i] = 0.0f;
+    
+    // Determine which outputs this thread computes
+    // Thread tid computes outputs at positions tid, tid+256, tid+512, tid+768
+    // Map to (row, col) within tile
+    int out_rows[outputs_per_thread], out_cols[outputs_per_thread];
+    #pragma unroll
+    for (int i = 0; i < outputs_per_thread; i++) {
+        const int flat_idx = tid + i * THREADS_PER_BLOCK;
+        out_rows[i] = flat_idx / TILE_N;
+        out_cols[i] = flat_idx % TILE_N;
+    }
+    
+    const block_q4_K* A_blocks = (const block_q4_K*)A;
+    const block_q4_K* B_blocks = (const block_q4_K*)B;
+    
+    // Iterate over K dimension
+    for (int kb = 0; kb < num_k_blocks; kb++) {
+        #pragma unroll
+        for (int i = 0; i < outputs_per_thread; i++) {
+            const int global_row = block_row + out_rows[i];
+            const int global_col = block_col + out_cols[i];
+            
+            if (global_row < M && global_col < N) {
+                const block_q4_K& a_block = A_blocks[global_row * num_k_blocks + kb];
+                const block_q4_K& b_block = B_blocks[global_col * num_k_blocks + kb];
+                acc[i] += q4k_block_dot(a_block, b_block);
             }
-            total_sum += (d_a * d_w) * (float)(dot_qq * (int)sc_a[g] * sc_w[g]);
-            total_sum -= (d_a * dmin_w) * (float)(sum_qa * (int)sc_a[g] * mn_w[g]);
-            total_sum -= (d_w * dmin_a) * (float)(sum_qw * (int)sc_w[g] * mn_a[g]);
-            total_sum += (dmin_a * dmin_w) * 32.0f * (float)((int)mn_a[g] * mn_w[g]);
         }
     }
-    __shared__ float s_part[32];
-    float warp_sum = total_sum;
+    
+    // Write results to global memory
     #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) warp_sum += __shfl_xor_sync(0xffffffff, warp_sum, mask);
-    if ((tid % 32) == 0) s_part[tid / 32] = warp_sum;
+    for (int i = 0; i < outputs_per_thread; i++) {
+        const int global_row = block_row + out_rows[i];
+        const int global_col = block_col + out_cols[i];
+        if (global_row < M && global_col < N) {
+            C[global_row * N + global_col] = acc[i];
+        }
+    }
+}
+
+// Fused FWHT + Quantize + GEMM kernel for M=1 (single token inference)
+// This eliminates kernel launch overhead by doing everything in one kernel
+// Each block computes M1_COLS_PER_BLOCK output columns
+// Input: float activations (not pre-quantized)
+// Weights: Q4_K blocks
+template<int K_DIM>
+__global__ void rrs_fused_m1_kernel(
+    const float* __restrict__ act_float,  // [1, K] float activations
+    const void* __restrict__ weights,      // [N, K/256] Q4_K weight blocks
+    float* __restrict__ output,            // [1, N] output
+    const int N
+) {
+    // Shared memory for FWHT-transformed and quantized activation
+    extern __shared__ char smem[];
+    float* s_act = (float*)smem;  // K_DIM floats for FWHT
+    block_q4_K* s_act_q4k = (block_q4_K*)(s_act + K_DIM);  // K_DIM/256 Q4_K blocks
+    
+    const int tid = threadIdx.x;
+    const int num_k_blocks = K_DIM / 256;
+    const int base_col = blockIdx.x * M1_COLS_PER_BLOCK;
+    
+    // Step 1: Load activations into shared memory
+    for (int i = tid; i < K_DIM; i += blockDim.x) {
+        s_act[i] = act_float[i];
+    }
     __syncthreads();
-    if (tid < 32) {
-        float final_sum = (tid < (n_threads / 32)) ? s_part[tid] : 0.0f;
+    
+    // Step 2: In-place FWHT on shared memory (chunked for non-power-of-2)
+    const int step = K_DIM & -K_DIM;  // Largest power of 2 that divides K_DIM
+    const float scale_fwht = rsqrtf((float)step);
+    
+    for (int chunk_base = 0; chunk_base < K_DIM; chunk_base += step) {
+        // FWHT butterfly operations for this chunk
+        for (int h = 1; h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = tid; i < step / 2; i += blockDim.x) {
+                const int block_idx = i / h;
+                const int offset = i % h;
+                const int idx1 = chunk_base + block_idx * stride + offset;
+                const int idx2 = idx1 + h;
+                fwht_butterfly(s_act[idx1], s_act[idx2]);
+            }
+            __syncthreads();
+        }
+        // Apply scale
+        for (int i = tid; i < step; i += blockDim.x) {
+            s_act[chunk_base + i] *= scale_fwht;
+        }
+        __syncthreads();
+    }
+    
+    // Step 3: Quantize to Q4_K format (one block per 256 elements)
+    // Each warp handles scale computation for its assigned blocks
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    const int num_warps = blockDim.x / 32;
+    
+    for (int b = warp_id; b < num_k_blocks; b += num_warps) {
+        float* block_data = s_act + b * 256;
+        block_q4_K* out_block = &s_act_q4k[b];
+        
+        // Find min/max for each of 8 subgroups (32 elements each)
+        // Each lane handles one element within the subgroup
+        __shared__ float s_scales_tmp[8 * 8];  // 8 warps * 8 subgroups
+        __shared__ float s_mins_tmp[8 * 8];
+        
+        float* my_scales = s_scales_tmp + warp_id * 8;
+        float* my_mins = s_mins_tmp + warp_id * 8;
+        
+        // Process 8 subgroups, each with 32 elements
+        for (int sg = 0; sg < 8; sg++) {
+            float val = block_data[sg * 32 + lane];
+            float vmin = val, vmax = val;
+            
+            // Warp reduction for min/max
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                vmin = fminf(vmin, __shfl_xor_sync(0xffffffff, vmin, mask));
+                vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffff, vmax, mask));
+            }
+            
+            if (vmin > 0) vmin = 0;
+            if (lane == 0) {
+                my_scales[sg] = (vmax - vmin) / 15.0f;
+                my_mins[sg] = -vmin;
+            }
+        }
+        __syncwarp();
+        
+        // Compute global d and dmin for this block
+        if (lane == 0) {
+            float max_s = my_scales[0], max_m = my_mins[0];
+            for (int i = 1; i < 8; i++) {
+                if (my_scales[i] > max_s) max_s = my_scales[i];
+                if (my_mins[i] > max_m) max_m = my_mins[i];
+            }
+            out_block->dm.x = __float2half(max_s / 63.0f);
+            out_block->dm.y = __float2half(max_m / 63.0f);
+            
+            // Pack scales
+            const float inv_s = (max_s > 0.0f) ? (63.0f / max_s) : 0.0f;
+            const float inv_m = (max_m > 0.0f) ? (63.0f / max_m) : 0.0f;
+            uint8_t ls[8], lm[8];
+            for (int j = 0; j < 8; j++) {
+                ls[j] = min(63, (int)(my_scales[j] * inv_s + 0.5f));
+                lm[j] = min(63, (int)(my_mins[j] * inv_m + 0.5f));
+            }
+            for (int j = 0; j < 4; j++) {
+                out_block->scales[j] = ls[j] | ((ls[j+4] & 0x30) << 2);
+                out_block->scales[j+4] = lm[j] | ((lm[j+4] & 0x30) << 2);
+            }
+            for (int j = 0; j < 4; j++) {
+                out_block->scales[j+8] = (ls[j+4] & 0x0F) | ((lm[j+4] & 0x0F) << 4);
+            }
+        }
+        __syncwarp();
+        
+        // Quantize the 256 values (8 subgroups of 32)
+        // Read back the packed scales
+        uint8_t sc[8], mn[8];
+        if (lane < 8) {
+            get_scale_min_k4_cuda(lane, out_block->scales, &sc[lane], &mn[lane]);
+        }
+        // Broadcast to all lanes
+        for (int i = 0; i < 8; i++) {
+            sc[i] = __shfl_sync(0xffffffff, sc[i], i);
+            mn[i] = __shfl_sync(0xffffffff, mn[i], i);
+        }
+        
+        const float d = __half2float(out_block->dm.x);
+        const float dm = __half2float(out_block->dm.y);
+        
+        // Each lane quantizes 8 values (256 / 32 lanes)
+        for (int chunk = 0; chunk < 4; chunk++) {
+            const int sg_lo = chunk * 2;
+            const int sg_hi = sg_lo + 1;
+            const float d_lo = d * sc[sg_lo];
+            const float dm_lo = dm * mn[sg_lo];
+            const float id_lo = (d_lo > 1e-10f) ? (1.0f / d_lo) : 0.0f;
+            const float d_hi = d * sc[sg_hi];
+            const float dm_hi = dm * mn[sg_hi];
+            const float id_hi = (d_hi > 1e-10f) ? (1.0f / d_hi) : 0.0f;
+            
+            const float val_lo = block_data[sg_lo * 32 + lane];
+            const float val_hi = block_data[sg_hi * 32 + lane];
+            int q_lo = min(15, max(0, (int)((val_lo + dm_lo) * id_lo + 0.5f)));
+            int q_hi = min(15, max(0, (int)((val_hi + dm_hi) * id_hi + 0.5f)));
+            out_block->qs[chunk * 32 + lane] = (uint8_t)(q_lo | (q_hi << 4));
+        }
+    }
+    __syncthreads();
+    
+    // Step 4: Compute dot products for M1_COLS_PER_BLOCK output columns
+    const block_q4_K* B_blocks = (const block_q4_K*)weights;
+    
+    for (int c = 0; c < M1_COLS_PER_BLOCK; c++) {
+        const int col = base_col + c;
+        if (col >= N) continue;
+        
+        const block_q4_K* B_col = B_blocks + col * num_k_blocks;
+        float sum = 0.0f;
+        
+        // Each thread processes a subset of K blocks
+        for (int kb = tid; kb < num_k_blocks; kb += blockDim.x) {
+            sum += q4k_block_dot(s_act_q4k[kb], B_col[kb]);
+        }
+        
+        // Warp reduction
         #pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1) final_sum += __shfl_xor_sync(0xffffffff, final_sum, mask);
-        if (tid == 0) C[row * N + col] = final_sum;
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum += __shfl_xor_sync(0xffffffff, sum, mask);
+        }
+        
+        // Block reduction
+        __shared__ float s_partial[8];
+        if (lane == 0) {
+            s_partial[warp_id] = sum;
+        }
+        __syncthreads();
+        
+        if (tid < 8) {
+            float val = (tid < num_warps) ? s_partial[tid] : 0.0f;
+            #pragma unroll
+            for (int mask = 4; mask > 0; mask >>= 1) {
+                val += __shfl_xor_sync(0xff, val, mask);
+            }
+            if (tid == 0) {
+                output[col] = val;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Fallback M=1 kernel for pre-quantized activations
+__global__ void rrs_gemm_q4k_q4k_m1_kernel(
+    const void* __restrict__ A,
+    const void* __restrict__ B,
+    float* __restrict__ C,
+    const int N, const int K
+) {
+    const int num_k_blocks = K / 256;
+    const int col = blockIdx.x;
+    if (col >= N) return;
+    
+    const int tid = threadIdx.x;
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
+    const block_q4_K* A_blocks = (const block_q4_K*)A;
+    const block_q4_K* B_blocks = (const block_q4_K*)B + col * num_k_blocks;
+    
+    float sum = 0.0f;
+    
+    // Each thread processes a subset of K blocks
+    for (int kb = tid; kb < num_k_blocks; kb += blockDim.x) {
+        sum += q4k_block_dot(A_blocks[kb], B_blocks[kb]);
+    }
+    
+    // Warp reduction
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+    
+    // Block reduction via shared memory
+    __shared__ float s_partial[8]; // Up to 8 warps
+    if (lane_id == 0) {
+        s_partial[warp_id] = sum;
+    }
+    __syncthreads();
+    
+    if (tid < 8) {
+        float val = (tid < (blockDim.x / 32)) ? s_partial[tid] : 0.0f;
+        #pragma unroll
+        for (int mask = 4; mask > 0; mask >>= 1) {
+            val += __shfl_xor_sync(0xff, val, mask);
+        }
+        if (tid == 0) {
+            C[col] = val;
+        }
+    }
+}
+
+// Batched M>1 kernel with better memory access pattern
+// Process multiple rows per block to improve cache utilization
+__global__ void rrs_gemm_q4k_q4k_batched_kernel(
+    const void* __restrict__ A,
+    const void* __restrict__ B,
+    float* __restrict__ C,
+    const int M, const int N, const int K
+) {
+    const int num_k_blocks = K / 256;
+    
+    // Each block handles one column (N) and multiple rows (M) 
+    const int col = blockIdx.x;
+    if (col >= N) return;
+    
+    const int tid = threadIdx.x;
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
+    const int num_warps = blockDim.x / 32;
+    
+    const block_q4_K* A_blocks = (const block_q4_K*)A;
+    const block_q4_K* B_blocks = (const block_q4_K*)B + col * num_k_blocks;
+    
+    // Each warp handles different rows
+    for (int row = warp_id; row < M; row += num_warps) {
+        const block_q4_K* A_row = A_blocks + row * num_k_blocks;
+        
+        float sum = 0.0f;
+        // Lanes within warp cooperate on K reduction
+        for (int kb = lane_id; kb < num_k_blocks; kb += 32) {
+            sum += q4k_block_dot(A_row[kb], B_blocks[kb]);
+        }
+        
+        // Warp reduction
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum += __shfl_xor_sync(0xffffffff, sum, mask);
+        }
+        
+        if (lane_id == 0) {
+            C[row * N + col] = sum;
+        }
     }
 }
 
@@ -285,12 +679,68 @@ __global__ void rrs_gemm_q4k_q4k_kernel(const void* __restrict__ A, const void* 
 void ggml_cuda_rrs_mul_mat(ggml_backend_cuda_context& ctx, const ggml_tensor* src0, const ggml_tensor* src1, ggml_tensor* dst) {
     const int M = src1->ne[1], N = src0->ne[1], K = src0->ne[0];
     cudaStream_t stream = ctx.stream();
-    size_t row_size = ggml_row_size(GGML_TYPE_Q4_K_RRS_ACT, K);
-    size_t total_size = M * row_size, actual_size;
-    void* d_act_q4k = ctx.pool().alloc(total_size, &actual_size);
-    ggml_cuda_rrs_fwht_quantize((const float*)src1->data, d_act_q4k, K, M, stream);
-    dim3 grid(N, M); rrs_gemm_q4k_q4k_kernel<<<grid, 256, 0, stream>>>(d_act_q4k, src0->data, (float*)dst->data, M, N, K);
-    ctx.pool().free(d_act_q4k, actual_size);
+    
+    // Select kernel based on M dimension
+    if (M == 1) {
+        // Use fused kernel for M=1 to minimize launch overhead
+        // Shared memory: K floats for FWHT + (K/256) Q4_K blocks for quantized act
+        const size_t smem_size = K * sizeof(float) + (K / 256) * sizeof(block_q4_K) + 64 * sizeof(float);
+        const int num_blocks = (N + M1_COLS_PER_BLOCK - 1) / M1_COLS_PER_BLOCK;
+        
+        // Select template based on K dimension (common sizes)
+        switch (K) {
+            case 512:
+                rrs_fused_m1_kernel<512><<<num_blocks, 256, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 1024:
+                rrs_fused_m1_kernel<1024><<<num_blocks, 256, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 2048:
+                rrs_fused_m1_kernel<2048><<<num_blocks, 256, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 2816:
+                rrs_fused_m1_kernel<2816><<<num_blocks, 256, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 4096:
+                rrs_fused_m1_kernel<4096><<<num_blocks, 256, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            default: {
+                // Fallback: separate FWHT+quantize then GEMM
+                size_t row_size = ggml_row_size(GGML_TYPE_Q4_K_RRS_ACT, K);
+                size_t actual_size;
+                void* d_act_q4k = ctx.pool().alloc(row_size, &actual_size);
+                ggml_cuda_rrs_fwht_quantize((const float*)src1->data, d_act_q4k, K, 1, stream);
+                rrs_gemm_q4k_q4k_m1_kernel<<<N, 256, 0, stream>>>(
+                    d_act_q4k, src0->data, (float*)dst->data, N, K);
+                ctx.pool().free(d_act_q4k, actual_size);
+                break;
+            }
+        }
+    } else {
+        // M > 1: allocate and quantize activations
+        size_t row_size = ggml_row_size(GGML_TYPE_Q4_K_RRS_ACT, K);
+        size_t total_size = M * row_size, actual_size;
+        void* d_act_q4k = ctx.pool().alloc(total_size, &actual_size);
+        ggml_cuda_rrs_fwht_quantize((const float*)src1->data, d_act_q4k, K, M, stream);
+        
+        if (M <= 32) {
+            // Small batch: one block per column, warps handle different rows
+            rrs_gemm_q4k_q4k_batched_kernel<<<N, 256, 0, stream>>>(
+                d_act_q4k, src0->data, (float*)dst->data, M, N, K);
+        } else {
+            // Large batch: tiled kernel
+            dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+            rrs_gemm_q4k_q4k_tiled_kernel<<<grid, THREADS_PER_BLOCK, 0, stream>>>(
+                d_act_q4k, src0->data, (float*)dst->data, M, N, K);
+        }
+        
+        ctx.pool().free(d_act_q4k, actual_size);
+    }
 }
 
 bool ggml_cuda_supports_rrs(const ggml_tensor* tensor) {
@@ -324,7 +774,8 @@ void ggml_cuda_rrs_benchmark(int M, int N, int K, int iterations, RRSBenchmarkRe
     result->quantize_time_ms /= iterations;
     ggml_cuda_rrs_fwht_quantize(d_B, d_B_q4k, K, N, stream);
     cudaEventRecord(start, stream);
-    for (int i = 0; i < iterations; i++) rrs_gemm_q4k_q4k_kernel<<<dim3(N, M), 256, 0, stream>>>(d_A_q4k, d_B_q4k, d_C, M, N, K);
+    dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+    for (int i = 0; i < iterations; i++) rrs_gemm_q4k_q4k_tiled_kernel<<<grid, THREADS_PER_BLOCK, 0, stream>>>(d_A_q4k, d_B_q4k, d_C, M, N, K);
     cudaEventRecord(stop, stream); cudaEventSynchronize(stop); cudaEventElapsedTime(&result->int4_wmma_time_ms, start, stop);
     result->int4_wmma_time_ms /= iterations;
     result->q8_repack_time_ms = 0.0f; result->M = M; result->N = N; result->K = K;
