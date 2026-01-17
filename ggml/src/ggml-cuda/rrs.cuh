@@ -76,11 +76,10 @@ void ggml_cuda_rrs_quantize_act(
     cudaStream_t stream);
 
 // Fused FWHT + Quantize (preferred - single pass)
+// Output: block_q4_K array [batch_size, n/256]
 void ggml_cuda_rrs_fwht_quantize(
     const float * x,       // input F32 [batch_size, n]
-    void * y,              // output Q4 packed [batch_size, n/2]
-    half * scales,         // output scales [batch_size, n/32]
-    half * mins,           // output mins [batch_size, n/32]
+    void * y,              // output block_q4_K [batch_size, n/256]
     int n,
     int batch_size,
     cudaStream_t stream);
