@@ -5234,6 +5234,8 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q3_K, data, nb);
             } break;
         case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_K, data, nb, d, dmin);
             } break;

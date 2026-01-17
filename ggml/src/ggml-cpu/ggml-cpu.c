@@ -8,12 +8,12 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
-#include "rrs.h"
 #include "ggml-threading.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
+#include "rrs.h"
 #include "ggml.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -385,17 +385,25 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
-    [GGML_TYPE_Q4_0_RRS] = {
+    [GGML_TYPE_Q4_K_RRS] = {
         .from_float = NULL,
-        .vec_dot = ggml_vec_dot_q4_0_rrs_q4_0_rrs,
-        .vec_dot_type = GGML_TYPE_Q4_0_RRS_ACT,
-        .nrows = 1,
+        .vec_dot = ggml_vec_dot_q4_K_rrs_q4_K_rrs,
+        .vec_dot_type = GGML_TYPE_Q4_K_RRS_ACT,
+#if defined (__ARM_FEATURE_MATMUL_INT8)
+        .nrows                    = 2,
+#else
+        .nrows                    = 1,
+#endif
     },
-    [GGML_TYPE_Q4_0_RRS_ACT] = {
-        .from_float = ggml_quantize_row_q4_0_rrs_act,
-        .vec_dot = ggml_vec_dot_q4_0_rrs_q4_0_rrs,
-        .vec_dot_type = GGML_TYPE_Q4_0_RRS_ACT,
-        .nrows = 1,
+    [GGML_TYPE_Q4_K_RRS_ACT] = {
+        .from_float = ggml_quantize_row_q4_K_rrs_act,
+        .vec_dot = ggml_vec_dot_q4_K_rrs_q4_K_rrs,
+        .vec_dot_type = GGML_TYPE_Q4_K_RRS_ACT,
+#if defined (__ARM_FEATURE_MATMUL_INT8)
+        .nrows                    = 2,
+#else
+        .nrows                    = 1,
+#endif
     },
 };
 
@@ -1279,18 +1287,24 @@ void ggml_compute_forward_mul_mat(
     const bool src1_cont = ggml_is_contiguous(src1);
 
     if (src1_cont) {
+        enum ggml_type llamafile_src0_type = src0->type;
+        enum ggml_type llamafile_src1_type = src1->type;
+
+        if (llamafile_src0_type == GGML_TYPE_Q4_K_RRS)     llamafile_src0_type = GGML_TYPE_Q4_K;
+        if (llamafile_src1_type == GGML_TYPE_Q4_K_RRS_ACT) llamafile_src1_type = GGML_TYPE_Q4_K;
+
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
-                                     ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                     ne01, ne11, ne00/ggml_blck_size(llamafile_src0_type),
                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
+                                     nb01/ggml_type_size(llamafile_src0_type),
                                      (const char *)src1->data + i12*nb12 + i13*nb13,
-                                     nb11/ggml_type_size(src1->type),
+                                     nb11/ggml_type_size(llamafile_src1_type),
                                      (char *)dst->data + i12*nb2 + i13*nb3,
                                      nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     src1->type,
+                                     llamafile_src0_type,
+                                     llamafile_src1_type,
                                      dst->type))
                     goto UseGgmlGemm1;
         return;
@@ -1310,7 +1324,7 @@ UseGgmlGemm1:;
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
         // RRS types require full-row quantization (FWHT is a global row transform)
-        const bool needs_full_row = (vec_dot_type == GGML_TYPE_Q4_0_RRS_ACT);
+        const bool needs_full_row = (vec_dot_type == GGML_TYPE_Q4_K_RRS_ACT);
 
         if (needs_full_row) {
             // Parallelize by rows, not within rows (FWHT needs entire row)
@@ -1352,18 +1366,24 @@ UseGgmlGemm1:;
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
+        enum ggml_type llamafile_src0_type = src0->type;
+        enum ggml_type llamafile_vec_dot_type = vec_dot_type;
+
+        if (llamafile_src0_type == GGML_TYPE_Q4_K_RRS)     llamafile_src0_type = GGML_TYPE_Q4_K;
+        if (llamafile_vec_dot_type == GGML_TYPE_Q4_K_RRS_ACT) llamafile_vec_dot_type = GGML_TYPE_Q4_K;
+
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
-                                     ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                     ne01, ne11, ne00/ggml_blck_size(llamafile_src0_type),
                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
+                                     nb01/ggml_type_size(llamafile_src0_type),
                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
-                                     row_size/ggml_type_size(vec_dot_type),
+                                     row_size/ggml_type_size(llamafile_vec_dot_type),
                                      (char *)dst->data + i12*nb2 + i13*nb3,
                                      nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     vec_dot_type,
+                                     llamafile_src0_type,
+                                     llamafile_vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
         return;
@@ -1578,7 +1598,7 @@ static void ggml_compute_forward_mul_mat_id(
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
         // RRS types require full-row quantization (FWHT is a global row transform)
-        const bool needs_full_row = (vec_dot_type == GGML_TYPE_Q4_0_RRS_ACT);
+        const bool needs_full_row = (vec_dot_type == GGML_TYPE_Q4_K_RRS_ACT);
 
         if (needs_full_row) {
             // Parallelize by rows, not within rows (FWHT needs entire row)

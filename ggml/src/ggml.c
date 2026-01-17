@@ -10,6 +10,9 @@
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 
+// RRS quantization function (defined in ggml-cpu/rrs.c)
+size_t quantize_q4_K_rrs(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
 #endif
@@ -718,21 +721,21 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
     },
-    [GGML_TYPE_Q4_0_RRS] = {
-        .type_name                = "q4_0_rrs",
-        .blck_size                = QK4_0,
-        .type_size                = sizeof(block_q4_0),
+    [GGML_TYPE_Q4_K_RRS] = {
+        .type_name                = "q4_K_rrs",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_K),
         .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
+        .from_float_ref           = NULL,
     },
-    [GGML_TYPE_Q4_0_RRS_ACT] = {
-        .type_name                = "q4_0_rrs_act",
-        .blck_size                = QK4_0,
-        .type_size                = sizeof(block_q4_0),
+    [GGML_TYPE_Q4_K_RRS_ACT] = {
+        .type_name                = "q4_K_rrs_act",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_q4_K),
         .is_quantized             = true,
-        .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
@@ -1391,7 +1394,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ3_XXS:       wtype = GGML_TYPE_IQ3_XXS;  break;
         case GGML_FTYPE_MOSTLY_IQ1_S:         wtype = GGML_TYPE_IQ1_S;    break;
         case GGML_FTYPE_MOSTLY_IQ1_M:         wtype = GGML_TYPE_IQ1_M;    break;
-        case GGML_FTYPE_MOSTLY_IQ4_NL:        wtype = GGML_TYPE_IQ4_NL;   break;
+        case GGML_FTYPE_MOSTLY_Q4_K_RRS:      wtype = GGML_TYPE_Q4_K_RRS; break;
         case GGML_FTYPE_MOSTLY_IQ4_XS:        wtype = GGML_TYPE_IQ4_XS;   break;
         case GGML_FTYPE_MOSTLY_IQ3_S:         wtype = GGML_TYPE_IQ3_S;    break;
         case GGML_FTYPE_MOSTLY_IQ2_S:         wtype = GGML_TYPE_IQ2_S;    break;
@@ -7539,6 +7542,7 @@ size_t ggml_quantize_chunk(
 
     switch (type) {
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_K_RRS: result = quantize_q4_K_rrs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

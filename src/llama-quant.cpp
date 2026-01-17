@@ -535,7 +535,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     llama_ftype ftype = params->ftype;
 
     switch (params->ftype) {
-        case LLAMA_FTYPE_MOSTLY_Q4_0: default_type = GGML_TYPE_Q4_0; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_0:     default_type = GGML_TYPE_Q4_0;     break;
+        case LLAMA_FTYPE_MOSTLY_Q4_K_RRS: default_type = GGML_TYPE_Q4_K_RRS; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1: default_type = GGML_TYPE_Q4_1; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0: default_type = GGML_TYPE_Q5_0; break;
         case LLAMA_FTYPE_MOSTLY_Q5_1: default_type = GGML_TYPE_Q5_1; break;
@@ -872,6 +873,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (quantize) {
             new_type = default_type;
+
+            // RRS types require power-of-2 dimensions for FWHT; fall back to standard Q4_0 otherwise
+            // RRS types require power-of-2 dimensions for FWHT
+            if (new_type == GGML_TYPE_Q4_K_RRS) {
+                const int64_t ne0 = tensor->ne[0];
+                const bool is_power_of_2 = (ne0 > 0) && ((ne0 & (ne0 - 1)) == 0);
+                if (!is_power_of_2) {
+                    LLAMA_LOG_DEBUG("(ne0=%lld not power of 2, using Q4_K) ", (long long)ne0);
+                    new_type = GGML_TYPE_Q4_K;
+                }
+            }
 
             // get more optimal quantization type based on the tensor shape, layer, etc.
             if (!params->pure && ggml_is_quantized(default_type)) {

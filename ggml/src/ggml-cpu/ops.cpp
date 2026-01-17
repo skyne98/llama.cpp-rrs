@@ -665,8 +665,8 @@ void ggml_compute_forward_add(
                 ggml_compute_forward_add_non_quantized(params, dst);
             } break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_RRS:
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -1115,8 +1115,8 @@ void ggml_compute_forward_add1(
                 }
             } break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_RRS:
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -1245,8 +1245,8 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_RRS:
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4271,8 +4271,8 @@ void ggml_compute_forward_out_prod(
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_RRS:
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4547,8 +4547,8 @@ void ggml_compute_forward_set(
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_RRS:
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -4774,19 +4774,26 @@ void ggml_compute_forward_get_rows(
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
-        case GGML_TYPE_Q4_0_RRS:
+        case GGML_TYPE_Q4_K_RRS:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
-                int64_t ne0 = dst->ne[0];
-                int64_t ne1 = dst->ne[1];
-                float * data = (float *) dst->data;
+
+                const int64_t ne0 = dst->ne[0];
                 if (ne0 > 0 && (ne0 & (ne0 - 1)) == 0) {
-                    for (int64_t i = 0; i < ne1; ++i) {
+                    const int64_t nr = ggml_nelements(dst->src[1]);
+                    const int ith = params->ith;
+                    const int nth = params->nth;
+                    const int dr = (nr + nth - 1)/nth;
+                    const int ir0 = dr*ith;
+                    const int ir1 = (int)MIN(ir0 + dr, nr);
+
+                    float * data = (float *) dst->data;
+                    for (int64_t i = ir0; i < ir1; ++i) {
                         ggml_fwht_impl(data + i * ne0, (int)ne0);
                     }
                 }
             } break;
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -5511,8 +5518,8 @@ void ggml_compute_forward_clamp(
             } break;
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_RRS:
-        case GGML_TYPE_Q4_0_RRS_ACT:
+        case GGML_TYPE_Q4_K_RRS:
+        case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
