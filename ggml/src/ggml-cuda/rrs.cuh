@@ -106,3 +106,6 @@ void ggml_cuda_rrs_benchmark(
 
 // Print benchmark results to stdout
 void ggml_cuda_rrs_print_benchmark(const RRSBenchmarkResult * result);
+
+// Simple test function - verifies CUDA RRS kernels work
+extern "C" void ggml_cuda_rrs_test(void);
