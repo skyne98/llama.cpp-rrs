@@ -1,10 +1,46 @@
 #include "rrs.cuh"
 #include "common.cuh"
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 #include <cstdio>
 
 using namespace nvcuda;
+
+// ============================================================================
+// SmemTensor helpers (from QuadMul)
+// ============================================================================
+
+#define CUDA_DEVICE_INLINE __device__ __forceinline__
+
+template <typename T, int ShapeX, int ShapeY, int ShapeZ>
+class SmemTensor3D {
+public:
+    T* startPtr;
+    T* endPtr;
+    
+    CUDA_DEVICE_INLINE SmemTensor3D(void* ptr) 
+        : startPtr(reinterpret_cast<T*>(ptr)), 
+          endPtr(reinterpret_cast<T*>(ptr) + ShapeX * ShapeY * ShapeZ) {}
+    
+    CUDA_DEVICE_INLINE T* get_ptr(int x, int y, int z) {
+        return &startPtr[x * ShapeY * ShapeZ + y * ShapeZ + z];
+    }
+};
+
+template <typename T>
+class GMemTensor2D {
+private:
+    T* startPtr;
+    int shapeY;
+public:
+    CUDA_DEVICE_INLINE GMemTensor2D(T* ptr, int x, int y) 
+        : startPtr(ptr), shapeY(y) {}
+    
+    CUDA_DEVICE_INLINE T* get_ptr(int x, int y) {
+        return &startPtr[x * shapeY + y];
+    }
+};
 
 // ============================================================================
 // Q4_K Format Constants and Scale Unpacking
@@ -382,19 +418,308 @@ void ggml_cuda_rrs_quantize_act(
 
 using I4 = wmma::experimental::precision::s4;
 
+// ============================================================================
+// QuadMul-style INT4 WMMA GEMM with 2-Stage Async Pipeline
+// ============================================================================
+
+#define WARP_SIZE 32
+#define ALIGN_SIZE 32  // Async copy alignment in bytes
+
+// Configuration template (following QuadMul IGemmConfig)
+template <int BlockRowWarps, int BlockColWarps, int WarpRowTiles, int WarpColTiles, 
+          int PatchM, int PatchN, int ChunkK, int NumStages,
+          int kWMMA_M, int kWMMA_N, int kWMMA_K>
+struct RRSGemmConfig {
+    static constexpr int kBlockRowWarps = BlockRowWarps;
+    static constexpr int kBlockColWarps = BlockColWarps;
+    static constexpr int kWarpRowTiles = WarpRowTiles;
+    static constexpr int kWarpColTiles = WarpColTiles;
+    static constexpr int kPatchM = PatchM;
+    static constexpr int kPatchN = PatchN;
+    static constexpr int kChunkK = ChunkK;
+    static constexpr int kNumStages = NumStages;
+    
+    // Derived
+    static constexpr int kBlockRowTiles = kWarpRowTiles * kBlockRowWarps;
+    static constexpr int kBlockColTiles = kWarpColTiles * kBlockColWarps;
+    static constexpr int kTileSizeM = kWMMA_M * kBlockRowTiles;
+    static constexpr int kTileSizeN = kWMMA_N * kBlockColTiles;
+    static constexpr int kTileSizeK = kWMMA_K * kChunkK;
+    
+    static constexpr int WMMA_M = kWMMA_M;
+    static constexpr int WMMA_N = kWMMA_N;
+    static constexpr int WMMA_K = kWMMA_K;
+};
+
+// Default configs for different M sizes (tuned for SM86/RTX 3090)
+// Thread count = WARP_SIZE * (BlockRowWarps/PatchM) * (BlockColWarps/PatchN)
+// Must be <= 256 for __launch_bounds__(256)
+//
+// Config params: <BlockRowWarps, BlockColWarps, WarpRowTiles, WarpColTiles, 
+//                 PatchM, PatchN, ChunkK, NumStages, WMMA_M, WMMA_N, WMMA_K>
+//
+// TileSizeM = WMMA_M * WarpRowTiles * BlockRowWarps
+// TileSizeN = WMMA_N * WarpColTiles * BlockColWarps
+// TileSizeK = WMMA_K * ChunkK
+
+// Small M (single token decode): 32 * 2 * 4 = 256 threads
+// TileM=32, TileN=64, TileK=64
+using ConfigM1   = RRSGemmConfig<2, 4, 2, 2, 1, 1, 2, 2, 8, 8, 32>;
+
+// Medium M (small batch): 32 * 2 * 4 = 256 threads  
+// TileM=32, TileN=128, TileK=64 - wider N for better occupancy
+using ConfigM32  = RRSGemmConfig<2, 4, 2, 4, 1, 1, 2, 2, 8, 8, 32>;
+
+// Large M (prefill): 32 * 4 * 2 = 256 threads
+// TileM=128, TileN=64, TileK=64 - taller M for prefill
+using ConfigM256 = RRSGemmConfig<4, 2, 4, 4, 1, 1, 2, 2, 8, 8, 32>;
+
+// Very large M (big prefill): 32 * 4 * 2 = 256 threads, with PatchM=2 for register tiling
+// TileM=128, TileN=64, TileK=128 - larger K chunk for better compute/memory ratio
+using ConfigM512 = RRSGemmConfig<4, 2, 4, 4, 2, 1, 4, 2, 8, 8, 32>;
+
+template<typename Config>
+__global__ void __launch_bounds__(256) rrs_gemm_i4_async_kernel(
+    const uint8_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    int32_t* __restrict__ C,
+    const int M, const int N, const int K)
+{
+#ifdef RRS_HAS_INT4_TC
+    extern __shared__ int8_t shared_memory[];
+    
+    // Fragment types for INT4 WMMA
+    using FragA = wmma::fragment<wmma::matrix_a, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, I4, wmma::row_major>;
+    using FragB = wmma::fragment<wmma::matrix_b, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, I4, wmma::col_major>;
+    using FragC = wmma::fragment<wmma::accumulator, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, int32_t>;
+    
+    // Set up multi-stage shared memory (double-buffered)
+    // A: [NumStages][TileSizeM][TileSizeK/2] (packed int4)
+    // B: [NumStages][TileSizeN][TileSizeK/2] (packed int4)
+    SmemTensor3D<uint8_t, Config::kNumStages, Config::kTileSizeM, Config::kTileSizeK / 2> 
+        smemA(shared_memory);
+    SmemTensor3D<uint8_t, Config::kNumStages, Config::kTileSizeN, Config::kTileSizeK / 2> 
+        smemB(smemA.endPtr);
+    
+    // Global memory views
+    GMemTensor2D<uint8_t> gmemA((uint8_t*)A, M, K / 2);
+    GMemTensor2D<uint8_t> gmemB((uint8_t*)B, N, K / 2);
+    GMemTensor2D<int32_t> gmemC(C, M, N);
+    
+    // Warp/thread indexing
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int warp_row = warp_id / (Config::kBlockColWarps / Config::kPatchN);
+    const int warp_col = warp_id % (Config::kBlockColWarps / Config::kPatchN);
+    
+    // Block position
+    const int block_row_start = blockIdx.x * Config::kTileSizeM;
+    const int block_col_start = blockIdx.y * Config::kTileSizeN;
+    
+    // Accumulator fragments
+    FragA a_frag[Config::kPatchM][Config::kWarpRowTiles];
+    FragB b_frag[Config::kPatchN][Config::kWarpColTiles];
+    FragC c_frag[Config::kPatchM][Config::kPatchN][Config::kWarpRowTiles][Config::kWarpColTiles];
+    
+    // Initialize accumulators
+    #pragma unroll
+    for (int pm = 0; pm < Config::kPatchM; pm++) {
+        #pragma unroll
+        for (int pn = 0; pn < Config::kPatchN; pn++) {
+            #pragma unroll
+            for (int i = 0; i < Config::kWarpRowTiles; i++) {
+                #pragma unroll
+                for (int j = 0; j < Config::kWarpColTiles; j++) {
+                    wmma::fill_fragment(c_frag[pm][pn][i][j], 0);
+                }
+            }
+        }
+    }
+    
+    // Lambda: async load A tile into shared memory stage
+    // Memory layout: smemA[stage][row][col_packed] where col_packed = TileSizeK/2 bytes
+    // Each thread loads 16 bytes (32 int4 values) per iteration
+    auto load_A_tile = [&](int stage, int k_offset) {
+        constexpr int BYTES_PER_LOAD = 16;  // 16 bytes = 32 int4 values
+        constexpr int ELEMENTS_PER_LOAD = BYTES_PER_LOAD * 2;  // 32 int4 elements
+        constexpr int total_bytes = Config::kTileSizeM * Config::kTileSizeK / 2;  // packed int4
+        constexpr int num_loads = total_bytes / BYTES_PER_LOAD;
+        
+        for (int i = threadIdx.x; i < num_loads; i += blockDim.x) {
+            // Linear index in bytes within the tile
+            const int byte_offset = i * BYTES_PER_LOAD;
+            const int row = byte_offset / (Config::kTileSizeK / 2);
+            const int col_bytes = byte_offset % (Config::kTileSizeK / 2);
+            const int global_row = block_row_start + row;
+            const int global_col = k_offset + col_bytes * 2;  // col in int4 elements
+            
+            if (global_row < M && global_col + ELEMENTS_PER_LOAD <= K) {
+                uint8_t* shared_ptr = smemA.get_ptr(stage, row, col_bytes);
+                uint8_t* global_ptr = gmemA.get_ptr(global_row, col_bytes + k_offset / 2);
+                __pipeline_memcpy_async(shared_ptr, global_ptr, BYTES_PER_LOAD);
+            } else {
+                // Zero-fill for boundary handling
+                uint8_t* shared_ptr = smemA.get_ptr(stage, row, col_bytes);
+                for (int b = 0; b < BYTES_PER_LOAD; b++) {
+                    shared_ptr[b] = 0;
+                }
+            }
+        }
+    };
+    
+    // Lambda: async load B tile into shared memory stage
+    auto load_B_tile = [&](int stage, int k_offset) {
+        constexpr int BYTES_PER_LOAD = 16;
+        constexpr int ELEMENTS_PER_LOAD = BYTES_PER_LOAD * 2;
+        constexpr int total_bytes = Config::kTileSizeN * Config::kTileSizeK / 2;
+        constexpr int num_loads = total_bytes / BYTES_PER_LOAD;
+        
+        for (int i = threadIdx.x; i < num_loads; i += blockDim.x) {
+            const int byte_offset = i * BYTES_PER_LOAD;
+            const int row = byte_offset / (Config::kTileSizeK / 2);
+            const int col_bytes = byte_offset % (Config::kTileSizeK / 2);
+            const int global_row = block_col_start + row;
+            const int global_col = k_offset + col_bytes * 2;
+            
+            if (global_row < N && global_col + ELEMENTS_PER_LOAD <= K) {
+                uint8_t* shared_ptr = smemB.get_ptr(stage, row, col_bytes);
+                uint8_t* global_ptr = gmemB.get_ptr(global_row, col_bytes + k_offset / 2);
+                __pipeline_memcpy_async(shared_ptr, global_ptr, BYTES_PER_LOAD);
+            } else {
+                uint8_t* shared_ptr = smemB.get_ptr(stage, row, col_bytes);
+                for (int b = 0; b < BYTES_PER_LOAD; b++) {
+                    shared_ptr[b] = 0;
+                }
+            }
+        }
+    };
+    
+    // Lambda: store C tile to global memory
+    auto store_C_tile = [&]() {
+        #pragma unroll
+        for (int pm = 0; pm < Config::kPatchM; pm++) {
+            #pragma unroll
+            for (int pn = 0; pn < Config::kPatchN; pn++) {
+                #pragma unroll
+                for (int i = 0; i < Config::kWarpRowTiles; i++) {
+                    #pragma unroll
+                    for (int j = 0; j < Config::kWarpColTiles; j++) {
+                        const int row = block_row_start + 
+                            ((warp_row * Config::kPatchM + pm) * Config::kWarpRowTiles + i) * Config::WMMA_M;
+                        const int col = block_col_start + 
+                            ((warp_col * Config::kPatchN + pn) * Config::kWarpColTiles + j) * Config::WMMA_N;
+                        
+                        // Only store if full WMMA tile fits in bounds
+                        // WMMA stores an 8x8 block, so check row+8 and col+8
+                        if (row + Config::WMMA_M <= M && col + Config::WMMA_N <= N) {
+                            wmma::store_matrix_sync(gmemC.get_ptr(row, col), 
+                                c_frag[pm][pn][i][j], N, wmma::mem_row_major);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    
+    // ========== 2-Stage Async Pipeline ==========
+    
+    // Stage 0: Initial load
+    load_A_tile(0, 0);
+    load_B_tile(0, 0);
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    
+    int current_stage = 0;
+    
+    for (int k = 0; k < K; k += Config::kTileSizeK) {
+        // Start loading next stage if available (overlap with compute)
+        if (k + Config::kTileSizeK < K) {
+            const int next_stage = 1 - current_stage;
+            load_A_tile(next_stage, k + Config::kTileSizeK);
+            load_B_tile(next_stage, k + Config::kTileSizeK);
+            __pipeline_commit();
+        }
+        
+        // Compute using current stage
+        #pragma unroll
+        for (int kk = 0; kk < Config::kTileSizeK; kk += Config::WMMA_K) {
+            // Load A fragments
+            #pragma unroll
+            for (int pm = 0; pm < Config::kPatchM; pm++) {
+                #pragma unroll
+                for (int i = 0; i < Config::kWarpRowTiles; i++) {
+                    const int a_row = (warp_row * Config::kPatchM + pm) * Config::kWarpRowTiles * Config::WMMA_M 
+                                      + i * Config::WMMA_M;
+                    wmma::load_matrix_sync(a_frag[pm][i],
+                        smemA.get_ptr(current_stage, a_row, kk / 2),
+                        Config::kTileSizeK);
+                }
+            }
+            
+            // Load B fragments
+            #pragma unroll
+            for (int pn = 0; pn < Config::kPatchN; pn++) {
+                #pragma unroll
+                for (int j = 0; j < Config::kWarpColTiles; j++) {
+                    const int b_row = (warp_col * Config::kPatchN + pn) * Config::kWarpColTiles * Config::WMMA_N 
+                                      + j * Config::WMMA_N;
+                    wmma::load_matrix_sync(b_frag[pn][j],
+                        smemB.get_ptr(current_stage, b_row, kk / 2),
+                        Config::kTileSizeK);
+                }
+            }
+            
+            // Matrix multiply-accumulate
+            #pragma unroll
+            for (int pm = 0; pm < Config::kPatchM; pm++) {
+                #pragma unroll
+                for (int pn = 0; pn < Config::kPatchN; pn++) {
+                    #pragma unroll
+                    for (int i = 0; i < Config::kWarpRowTiles; i++) {
+                        #pragma unroll
+                        for (int j = 0; j < Config::kWarpColTiles; j++) {
+                            wmma::mma_sync(c_frag[pm][pn][i][j], 
+                                          a_frag[pm][i], b_frag[pn][j], 
+                                          c_frag[pm][pn][i][j]);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Wait for next stage to finish loading
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        
+        // Swap stages
+        current_stage = 1 - current_stage;
+    }
+    
+    // Store results
+    store_C_tile();
+    
+#else
+    (void)A; (void)B; (void)C; (void)M; (void)N; (void)K;
+#endif
+}
+
+// ============================================================================
+// Legacy kernel (kept for fallback/comparison)
+// ============================================================================
+
 // WMMA tile dimensions for INT4: 8x8x32
 constexpr int WMMA_M = 8;
 constexpr int WMMA_N = 8;
 constexpr int WMMA_K = 32;
 
-// Block tiling configuration
+// Block tiling configuration (legacy)
 constexpr int BLOCK_WARPS_M = 4;
 constexpr int BLOCK_WARPS_N = 4;
 constexpr int WARP_TILES_M = 2;
 constexpr int WARP_TILES_N = 4;
 
 template<int TILE_M, int TILE_N, int TILE_K>
-__global__ void __launch_bounds__(256) rrs_gemm_i4_kernel(
+__global__ void __launch_bounds__(256) rrs_gemm_i4_kernel_legacy(
     const uint8_t* __restrict__ A,
     const uint8_t* __restrict__ B,
     int* __restrict__ C_i32,
@@ -510,8 +835,78 @@ __global__ void __launch_bounds__(256) rrs_gemm_i4_kernel(
 }
 
 // ============================================================================
+// Kernel Launch Helpers
+// ============================================================================
+
+template<typename Config>
+void launch_rrs_gemm_i4_async(
+    const uint8_t* A, const uint8_t* B, int32_t* C,
+    int M, int N, int K, cudaStream_t stream)
+{
+    dim3 grid((M + Config::kTileSizeM - 1) / Config::kTileSizeM,
+              (N + Config::kTileSizeN - 1) / Config::kTileSizeN);
+    dim3 block(WARP_SIZE * (Config::kBlockRowWarps / Config::kPatchM) * 
+                           (Config::kBlockColWarps / Config::kPatchN));
+    
+    // Shared memory: 2 stages * (A tile + B tile)
+    size_t smem_size = Config::kNumStages * 
+        (Config::kTileSizeM * Config::kTileSizeK / 2 + 
+         Config::kTileSizeN * Config::kTileSizeK / 2);
+    
+    rrs_gemm_i4_async_kernel<Config><<<grid, block, smem_size, stream>>>(A, B, C, M, N, K);
+}
+
+// Select config based on M dimension
+inline void rrs_gemm_i4_dispatch(
+    const uint8_t* A, const uint8_t* B, int32_t* C,
+    int M, int N, int K, cudaStream_t stream)
+{
+    if (M <= 16) {
+        launch_rrs_gemm_i4_async<ConfigM1>(A, B, C, M, N, K, stream);
+    } else if (M <= 64) {
+        launch_rrs_gemm_i4_async<ConfigM32>(A, B, C, M, N, K, stream);
+    } else if (M <= 256) {
+        launch_rrs_gemm_i4_async<ConfigM256>(A, B, C, M, N, K, stream);
+    } else {
+        launch_rrs_gemm_i4_async<ConfigM512>(A, B, C, M, N, K, stream);
+    }
+}
+
+// ============================================================================
 // Dequantization Kernel with Proper Q4_K Scale Handling
 // ============================================================================
+
+// Simple dequant kernel for benchmark - uses separate scales arrays (not Q4_K block format)
+__global__ void rrs_dequant_simple_kernel(
+    const int* __restrict__ C_i32,
+    float* __restrict__ C_f32,
+    const half* __restrict__ act_scales,
+    const half* __restrict__ act_mins,
+    const half* __restrict__ weight_scales,
+    const half* __restrict__ weight_mins,
+    const int M, const int N, const int K)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (row >= M || col >= N) return;
+    
+    const int sum_i32 = C_i32[row * N + col];
+    const int groups = K / 32;
+    
+    // Compute average scales for both activation and weight
+    float act_scale_sum = 0.0f;
+    float weight_scale_sum = 0.0f;
+    for (int g = 0; g < groups; g++) {
+        act_scale_sum += __half2float(act_scales[row * groups + g]);
+        weight_scale_sum += __half2float(weight_scales[col * groups + g]);
+    }
+    float avg_act_scale = act_scale_sum / groups;
+    float avg_weight_scale = weight_scale_sum / groups;
+    
+    // Simple dequantization: scale the INT4 dot product result
+    C_f32[row * N + col] = (float)sum_i32 * avg_act_scale * avg_weight_scale;
+}
 
 // For Q4_K weights: reconstruct using per-group 6-bit scales
 // For simple activations: use direct fp16 scales
@@ -699,31 +1094,20 @@ void ggml_cuda_rrs_gemm_q4q4(
     const half* scales_B, const half* mins_B,
     cudaStream_t stream)
 {
-    constexpr int TILE_M = WMMA_M * WARP_TILES_M * BLOCK_WARPS_M;  // 64
-    constexpr int TILE_N = WMMA_N * WARP_TILES_N * BLOCK_WARPS_N;  // 128
-    constexpr int TILE_K = WMMA_K * 2;  // 64
+    int32_t* C_i32;
+    cudaMallocAsync(&C_i32, M * N * sizeof(int32_t), stream);
     
-    int* C_i32;
-    cudaMallocAsync(&C_i32, M * N * sizeof(int), stream);
+    // Use new async pipeline kernel with automatic config selection
+    rrs_gemm_i4_dispatch(
+        (const uint8_t*)A, (const uint8_t*)B, C_i32,
+        M, N, K, stream);
     
-    const int threads = 256;
-    dim3 block(threads);
-    dim3 grid((M + TILE_M - 1) / TILE_M, 
-              (N + TILE_N - 1) / TILE_N);
-    
-    const size_t smem_size = (TILE_M * TILE_K + TILE_N * TILE_K) / 2;
-    
-    rrs_gemm_i4_kernel<TILE_M, TILE_N, TILE_K>
-        <<<grid, block, smem_size, stream>>>(
-            (const uint8_t*)A, (const uint8_t*)B, C_i32,
-            M, N, K, K, K, N);
-    
-    // Simple dequantization (average scales)
+    // Simple dequantization using separate scale arrays
     dim3 dq_block(16, 16);
     dim3 dq_grid((M + 15) / 16, (N + 15) / 16);
     
-    rrs_dequant_q4k_kernel<<<dq_grid, dq_block, 0, stream>>>(
-        C_i32, C, scales_A, mins_A, scales_B, M, N, K);
+    rrs_dequant_simple_kernel<<<dq_grid, dq_block, 0, stream>>>(
+        C_i32, C, scales_A, mins_A, scales_B, mins_B, M, N, K);
     
     cudaFreeAsync(C_i32, stream);
 }
@@ -762,9 +1146,9 @@ void ggml_cuda_rrs_gemm_q4_via_q8(
     rrs_gemm_q8_dp4a_kernel<<<grid, block, 0, stream>>>(
         A_q8, B_q8, C_i32, M, N, K);
     
-    // Dequantize (simplified)
-    rrs_dequant_q4k_kernel<<<grid, block, 0, stream>>>(
-        C_i32, C, scales_A_q8, mins_A, scales_B, M, N, K);
+    // Dequantize using simple kernel (separate scale arrays)
+    rrs_dequant_simple_kernel<<<grid, block, 0, stream>>>(
+        C_i32, C, scales_A_q8, mins_A, scales_B, mins_B, M, N, K);
     
     cudaFreeAsync(A_q8, stream);
     cudaFreeAsync(B_q8, stream);
@@ -1023,16 +1407,49 @@ extern "C" void ggml_cuda_rrs_test(void) {
     const int iterations = 50;
     RRSBenchmarkResult result;
     
-    // Test with M=1 (single token inference) - this configuration works
+    // Test with M=1 (single token inference)
     printf("=== Single Token Inference (M=1, N=2048, K=2048) ===\n");
     ggml_cuda_rrs_benchmark(1, 2048, 2048, iterations, &result);
     ggml_cuda_rrs_print_benchmark(&result);
     printf("\n");
     
-    // Note: Larger M values require GEMM kernel fixes for proper boundary handling
-    // when M < TILE_M (64). The INT4 WMMA kernel needs M >= 64 for correct operation.
+    // Test with M=32 (small batch)
+    printf("=== Small Batch (M=32, N=2048, K=2048) ===\n");
+    ggml_cuda_rrs_benchmark(32, 2048, 2048, iterations, &result);
+    ggml_cuda_rrs_print_benchmark(&result);
+    printf("\n");
+    
+    // Test with M=128 (medium batch)
+    printf("=== Medium Batch (M=128, N=2048, K=2048) ===\n");
+    ggml_cuda_rrs_benchmark(128, 2048, 2048, iterations, &result);
+    ggml_cuda_rrs_print_benchmark(&result);
+    printf("\n");
+    
+    // Test with M=512 (large batch / prefill)
+    printf("=== Large Batch / Prefill (M=512, N=2048, K=2048) ===\n");
+    ggml_cuda_rrs_benchmark(512, 2048, 2048, iterations, &result);
+    ggml_cuda_rrs_print_benchmark(&result);
+    printf("\n");
+    
+    // Test with larger N,K (typical LLM dimensions)
+    printf("=== LLM-scale (M=256, N=8192, K=8192) ===\n");
+    ggml_cuda_rrs_benchmark(256, 8192, 8192, iterations, &result);
+    ggml_cuda_rrs_print_benchmark(&result);
+    printf("\n");
+    
+    // Test with very large M (big prefill)
+    printf("=== Big Prefill (M=1024, N=8192, K=8192) ===\n");
+    ggml_cuda_rrs_benchmark(1024, 8192, 8192, iterations, &result);
+    ggml_cuda_rrs_print_benchmark(&result);
+    printf("\n");
+    
+    // Test with QuadMul reference size (from their benchmarks)
+    printf("=== QuadMul Reference (M=2048, N=8192, K=8192) ===\n");
+    ggml_cuda_rrs_benchmark(2048, 8192, 8192, iterations, &result);
+    ggml_cuda_rrs_print_benchmark(&result);
+    printf("\n");
     
     printf("RRS CUDA Test: COMPLETED\n");
-    printf("\nNote: Current INT4 WMMA kernel requires M >= TILE_M (64) for batched inference.\n");
-    printf("For M=1 single-token inference, Q8 dp4a path is recommended (faster for small M).\n");
+    printf("\nReference: QuadMul 4090 achieves 700-760 TOPS for M=1024-2048, N=8192, K=8192\n");
+    printf("RTX 3090 theoretical INT4 peak: ~568 TOPS\n");
 }
