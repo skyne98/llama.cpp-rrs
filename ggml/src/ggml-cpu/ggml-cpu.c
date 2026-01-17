@@ -2704,6 +2704,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
         GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
         UNUSED(rc);
     }
+    ggml_rrs_free_scratch();
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
@@ -3094,7 +3095,10 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         }
 
         // This needs to be checked for after the cond_wait
-        if (threadpool->stop) break;
+        if (threadpool->stop) {
+            ggml_rrs_free_scratch();
+            break;
+        }
 
         // Check if there is new work
         // The main thread is the only one that can dispatch new work

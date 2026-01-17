@@ -4779,7 +4779,7 @@ void ggml_compute_forward_get_rows(
                 ggml_compute_forward_get_rows_q(params, dst);
 
                 const int64_t ne0 = dst->ne[0];
-                if (ne0 > 0 && (ne0 & (ne0 - 1)) == 0) {
+                if (ne0 > 0) {
                     const int64_t nr = ggml_nelements(dst->src[1]);
                     const int ith = params->ith;
                     const int nth = params->nth;
@@ -4787,9 +4787,13 @@ void ggml_compute_forward_get_rows(
                     const int ir0 = dr*ith;
                     const int ir1 = (int)MIN(ir0 + dr, nr);
 
+                    const int step = (int)(ne0 & -ne0);
+
                     float * data = (float *) dst->data;
                     for (int64_t i = ir0; i < ir1; ++i) {
-                        ggml_fwht_impl(data + i * ne0, (int)ne0);
+                        for (int j = 0; j < ne0; j += step) {
+                            ggml_fwht_impl(data + i * ne0 + j, step);
+                        }
                     }
                 }
             } break;
