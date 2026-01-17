@@ -11,7 +11,17 @@
 #include "ggml-quants.h"
 
 // RRS quantization function (defined in ggml-cpu/rrs.c)
-size_t quantize_q4_K_rrs(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+GGML_API size_t quantize_q4_K_rrs(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+
+// Weak dummy implementation to satisfy the linker when building with GGML_BACKEND_DL=ON
+// The real implementation is in libggml-cpu.so and will be loaded at runtime.
+#ifdef GGML_BACKEND_DL
+__attribute__((weak))
+size_t quantize_q4_K_rrs(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)src; (void)dst; (void)nrow; (void)n_per_row; (void)quant_weights;
+    GGML_ABORT("quantize_q4_K_rrs not implemented in ggml-base");
+}
+#endif
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>

@@ -92,6 +92,59 @@ static __global__ void k_get_rows_back_float(
     dst[dst_row*ncols + col] = sum;
 }
 
+// Special kernel for Q4_K_RRS get_rows
+template<typename dst_t>
+static __global__ void k_get_rows_q4_k_rrs(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, 
+        const int64_t ne11, const int64_t ne12, 
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+        for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+            const int i10 =  blockIdx.x;
+            const int i11 =  z / ne12;
+            const int i12 =  z % ne12;
+
+            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+            dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+            // Q4_K uses block_q4_K (256 elements)
+            const block_q4_K * src0_row = (const block_q4_K *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+
+            const int ib = i00 / 256;
+            const int iq = i00 % 256;
+            
+            const block_q4_K * b = src0_row + ib;
+            
+            const float d = __half2float(b->dm.x);
+            const float dmin = __half2float(b->dm.y);
+            
+            // 4 chunks of 64 elements. Each chunk has 2 groups of 32.
+            const int chunk = iq / 64;
+            const int offset = iq % 64;
+            // Byte index in qs (32 bytes per chunk)
+            const int byte_idx = chunk * 32 + (offset % 32);
+            
+            // Group index: chunk*2 + (0 for low nibbles 0..31, 1 for high nibbles 32..63)
+            const int group = chunk * 2 + (offset >= 32 ? 1 : 0);
+            
+            uint8_t sc, mn;
+            get_scale_min_k4_cuda(group, b->scales, &sc, &mn);
+            
+            const float scale = d * sc;
+            const float min   = dmin * mn;
+            
+            const uint8_t packed = b->qs[byte_idx];
+            const int val = (offset < 32) ? (packed & 0xF) : (packed >> 4);
+            
+            dst_row[i00] = ggml_cuda_cast<dst_t>((val - 8.0f) * scale - min);
+        }
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
 static void get_rows_cuda_q(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -217,9 +270,26 @@ void get_rows_cuda(
     // Handle Q4_K_RRS specially - requires float output and inverse FWHT
     if (src0_type == GGML_TYPE_Q4_K_RRS) {
         GGML_ASSERT(dst_type == GGML_TYPE_F32 && "Q4_K_RRS GET_ROWS requires F32 destination");
-        // Dequantize using Q4_0 path (Q4_K_RRS stores quants similarly)
-        get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, (float*)dst_d,
-            ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        
+        const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+        const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+        // Strides in elements
+        const size_t s1 = nb1 / sizeof(float);
+        const size_t s2 = nb2 / sizeof(float);
+        const size_t s3 = nb3 / sizeof(float);
+        const size_t s10 = nb10 / sizeof(int32_t);
+        const size_t s11 = nb11 / sizeof(int32_t);
+        const size_t s12 = nb12 / sizeof(int32_t);
+
+        k_get_rows_q4_k_rrs<float><<<block_nums, block_dims, 0, stream>>>(
+            src0_d, src1_d, (float*)dst_d,
+            ne00, ne11, ne12,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+
         // Apply inverse FWHT to convert from Hadamard domain back to spatial domain
         // FWHT is self-inverse (with proper scaling)
         if (ne10 > 0) {

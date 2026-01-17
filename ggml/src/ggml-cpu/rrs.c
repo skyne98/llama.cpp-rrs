@@ -280,7 +280,7 @@ void ggml_quantize_row_q4_K_rrs_act(const float * x, void * y, int64_t k) {
     quantize_row_q4_K_fast(scratch, y, k);
 }
 
-size_t quantize_q4_K_rrs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+GGML_API size_t quantize_q4_K_rrs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights;
     size_t row_size = ggml_row_size(GGML_TYPE_Q4_K_RRS, n_per_row);
     char * qrow = (char *)dst;

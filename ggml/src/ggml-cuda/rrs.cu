@@ -2,13 +2,108 @@
 #include "common.cuh"
 
 // Debug flag - set to 1 to enable debug output
-#define RRS_DEBUG 0
+#define RRS_DEBUG 1
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>
 #include <mma.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 using namespace nvcuda;
+
+#if RRS_DEBUG
+extern "C" void ggml_quantize_row_q4_K_rrs_act(const float * x, void * y, int64_t k);
+
+static inline void rrs_get_scale_min_k4_host(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static inline int rrs_decode_cpu_q4k_value(const block_q4_K* b, int idx) {
+    const int chunk = idx / 64;
+    const int offset = idx % 64;
+    const int byte = chunk * 32 + (offset & 31);
+    const uint8_t packed = b->qs[byte];
+    return (offset < 32) ? (packed & 0x0F) : (packed >> 4);
+}
+
+static inline int rrs_decode_cuda_q4_value(const uint8_t* q, int idx) {
+    const int group = idx / 32;
+    const int idx_in_group = idx % 32;
+    const int byte = group * 16 + (idx_in_group & 15);
+    const uint8_t packed = q[byte];
+    const int nibble = (idx_in_group < 16) ? (packed & 0x0F) : (packed >> 4);
+    const int q_signed = (nibble >= 8) ? (nibble - 16) : nibble;
+    return q_signed + 8;
+}
+
+static void rrs_debug_compare_act_quant(
+    const float* h_act_f32,
+    int k,
+    const uint8_t* h_act_q4,
+    const half* h_act_scales,
+    const half* h_act_mins) {
+
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_K_RRS_ACT, k);
+    uint8_t* cpu_row = (uint8_t*)malloc(row_size);
+    if (!cpu_row) {
+        fprintf(stderr, "[RRS CUDA] Debug compare: failed to allocate CPU row buffer\n");
+        return;
+    }
+
+    ggml_quantize_row_q4_K_rrs_act(h_act_f32, cpu_row, k);
+
+    const block_q4_K* b = (const block_q4_K*)cpu_row;
+    uint8_t sc0 = 0, mn0 = 0;
+    rrs_get_scale_min_k4_host(0, b->scales, &sc0, &mn0);
+
+    const float cpu_scale0 = GGML_FP16_TO_FP32(*(const uint16_t *)&b->dm.x) * sc0;
+    const float cpu_min0 = GGML_FP16_TO_FP32(*(const uint16_t *)&b->dm.y) * mn0;
+    const float cpu_offset0 = 8.0f * cpu_scale0 - cpu_min0;
+    const float cuda_scale0 = h_act_scales ? __half2float(h_act_scales[0]) : 0.0f;
+    const float cuda_offset0 = h_act_mins ? __half2float(h_act_mins[0]) : 0.0f;
+
+    fprintf(stderr,
+        "[RRS CUDA] ACT scale/min g0 CPU: scale=%f min=%f offset=%f | CUDA: scale=%f offset=%f\n",
+        cpu_scale0, cpu_min0, cpu_offset0, cuda_scale0, cuda_offset0);
+
+    fprintf(stderr, "[RRS CUDA] ACT q4 first 16 CPU:");
+    for (int i = 0; i < 16; i++) {
+        fprintf(stderr, " %d", rrs_decode_cpu_q4k_value(b, i));
+    }
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[RRS CUDA] ACT q4 first 16 CUDA:");
+    for (int i = 0; i < 16; i++) {
+        fprintf(stderr, " %d", rrs_decode_cuda_q4_value(h_act_q4, i));
+    }
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[RRS CUDA] ACT dequant first 8 CPU:");
+    for (int i = 0; i < 8; i++) {
+        const int q = rrs_decode_cpu_q4k_value(b, i);
+        const float v = cpu_scale0 * (float)q - cpu_min0;
+        fprintf(stderr, " %f", v);
+    }
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "[RRS CUDA] ACT dequant first 8 CUDA:");
+    for (int i = 0; i < 8; i++) {
+        const int q = rrs_decode_cuda_q4_value(h_act_q4, i);
+        const float v = cuda_scale0 * (float)(q - 8) + cuda_offset0;
+        fprintf(stderr, " %f", v);
+    }
+    fprintf(stderr, "\n");
+
+    free(cpu_row);
+}
+#endif
 
 // ============================================================================
 // SmemTensor helpers (from QuadMul)
@@ -53,18 +148,6 @@ public:
 // 12 bytes of packed 6-bit scales/mins
 // d (fp16): super-scale for dequantizing per-group scales
 // dmin (fp16): super-scale for dequantizing per-group mins
-
-__device__ __forceinline__ void get_scale_min_k4_cuda(
-    int j, const uint8_t* q, uint8_t* d, uint8_t* m) 
-{
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4);
-    }
-}
 
 __device__ __forceinline__ void unpack_scales_mins_k4_cuda(
     const uint8_t* scales, uint8_t* sc, uint8_t* mn)
@@ -230,57 +313,109 @@ __global__ void quantize_act_q4_simple_kernel(
 {
     const int row = blockIdx.x;
     if (row >= batch_size) return;
-    
+
     const float* x_row = x + row * n;
     const int groups = n / 32;
-    
-    const int group = blockIdx.y * blockDim.y + threadIdx.y;
-    if (group >= groups) return;
-    
-    const int lane = threadIdx.x;
-    const int base = group * 32;
-    
-    float val = (base + lane < n) ? x_row[base + lane] : 0.0f;
-    
-    // Warp-level reduction for min/max (asymmetric quantization matching Q4_K)
-    float vmin = val;
-    float vmax = val;
-    
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
-        vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
-    }
-    
-    // Q4_K style: if min > 0, set to 0
-    if (vmin > 0) vmin = 0;
-    const float qmin = -vmin;
-    const float range = vmax - vmin;
-    const float scale = range / 15.0f;
-    const float inv_scale = (scale > 1e-10f) ? (1.0f / scale) : 0.0f;
-    
-    // Quantize to unsigned [0, 15], then convert to signed [-8, 7]
-    int q_unsigned = __float2int_rn((val - vmin) * inv_scale);
-    q_unsigned = max(0, min(15, q_unsigned));
-    int q_signed = q_unsigned - 8;
-    int q_4bit = q_signed & 0xF;
-    
-    // Pack two 4-bit values per byte
-    const int pair_idx = lane % 16;
-    int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
-    int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
-    int packed = lo | (hi << 4);
-    
-    if (lane < 16) {
-        const int out_idx = row * (n / 2) + group * 16 + pair_idx;
-        qs[out_idx] = (uint8_t)packed;
-    }
-    
-    if (lane == 0) {
-        scales[row * groups + group] = __float2half(scale);
-        // Store offset for dequant: 8*scale - min (matching weight conversion formula)
-        float offset = 8.0f * scale - qmin;
-        mins[row * groups + group] = __float2half(offset);
+    const int blocks_per_row = n / 256;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    __shared__ float s_scales[8];
+    __shared__ float s_mins[8];
+    __shared__ float s_d;
+    __shared__ float s_dmin;
+    __shared__ float s_inv_scale;
+    __shared__ float s_inv_min;
+
+    for (int block = 0; block < blocks_per_row; ++block) {
+        if (warp_id < 8) {
+            const int base = block * 256 + warp_id * 32;
+            float val = x_row[base + lane];
+
+            float vmin = val;
+            float vmax = val;
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
+                vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
+            }
+
+            if (vmin > 0) vmin = 0;
+            const float gscale = (vmax - vmin) / 15.0f;
+            const float gmin_pos = -vmin;
+
+            if (lane == 0) {
+                s_scales[warp_id] = gscale;
+                s_mins[warp_id] = gmin_pos;
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            float max_scale = s_scales[0];
+            float max_min = s_mins[0];
+            #pragma unroll
+            for (int i = 1; i < 8; i++) {
+                if (s_scales[i] > max_scale) max_scale = s_scales[i];
+                if (s_mins[i] > max_min) max_min = s_mins[i];
+            }
+
+            s_d = (max_scale > 0.0f) ? (max_scale / 63.0f) : 0.0f;
+            s_dmin = (max_min > 0.0f) ? (max_min / 63.0f) : 0.0f;
+            s_inv_scale = (max_scale > 0.0f) ? (63.0f / max_scale) : 0.0f;
+            s_inv_min = (max_min > 0.0f) ? (63.0f / max_min) : 0.0f;
+        }
+
+        __syncthreads();
+
+        if (warp_id < 8) {
+            const float gscale = s_scales[warp_id];
+            const float gmin_pos = s_mins[warp_id];
+
+            int ls = (int)(s_inv_scale * gscale + 0.5f);
+            int lm = (int)(s_inv_min * gmin_pos + 0.5f);
+            if (ls < 0) ls = 0; if (ls > 63) ls = 63;
+            if (lm < 0) lm = 0; if (lm > 63) lm = 63;
+
+            const float d = s_d;
+            const float dmin = s_dmin;
+            const float d_group = d * (float)ls;
+            const float dm_group = dmin * (float)lm;
+            const float inv_d = (d_group > 1e-10f) ? (1.0f / d_group) : 0.0f;
+
+            const int base = block * 256 + warp_id * 32;
+            const float val = x_row[base + lane];
+            
+            // Asymmetric quant: q = (val + min) / scale
+            int q = (int)((val + dm_group) * inv_d + 0.5f);
+            if (q < 0) q = 0;
+            if (q > 15) q = 15;
+
+            // Map 0..15 to -8..7 for signed storage
+            const int q_signed = q - 8;
+            const int q_4bit = q_signed & 0xF;
+
+            const int pair_idx = lane & 15;
+            const int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
+            const int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
+            const int packed = lo | (hi << 4);
+
+            const int group = block * 8 + warp_id;
+            if (lane < 16) {
+                qs[row * (n / 2) + group * 16 + pair_idx] = (uint8_t)packed;
+            }
+
+            if (lane == 0) {
+                const float scale = d_group;
+                const float offset = 8.0f * scale - dm_group;
+                scales[row * groups + group] = __float2half(scale);
+                mins[row * groups + group] = __float2half(offset);
+            }
+        }
+
+        __syncthreads();
     }
 }
 
@@ -332,55 +467,254 @@ __global__ void fwht_quantize_kernel(
     }
     __syncthreads();
     
-    // Quantize per-32 groups using ASYMMETRIC format matching Q4_K (with mins)
-    // This matches the CPU's quantize_row_q4_K_fast behavior
+    // Quantize per-256 block using Q4_K layout (matches CPU quantize_row_q4_K_fast)
     // WMMA INT4 requires signed values, so we convert unsigned [0,15] to signed [-8,7]
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int num_warps = blockDim.x / 32;
+    const int blocks_per_row = N / 256;
+
+    __shared__ float s_scales[8];
+    __shared__ float s_mins[8];
+    __shared__ float s_d;
+    __shared__ float s_dmin;
+    __shared__ float s_inv_scale;
+    __shared__ float s_inv_min;
+
+    for (int block = 0; block < blocks_per_row; ++block) {
+        if (warp_id < 8) {
+            const int base = block * 256 + warp_id * 32;
+            float val = smem_fq[base + lane];
+
+            float vmin = val;
+            float vmax = val;
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
+                vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
+            }
+
+            if (vmin > 0) vmin = 0;
+            const float gscale = (vmax - vmin) / 15.0f;
+            const float gmin_pos = -vmin;
+
+            if (lane == 0) {
+                s_scales[warp_id] = gscale;
+                s_mins[warp_id] = gmin_pos;
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            float max_scale = s_scales[0];
+            float max_min = s_mins[0];
+            #pragma unroll
+            for (int i = 1; i < 8; i++) {
+                if (s_scales[i] > max_scale) max_scale = s_scales[i];
+                if (s_mins[i] > max_min) max_min = s_mins[i];
+            }
+
+            s_d = (max_scale > 0.0f) ? (max_scale / 63.0f) : 0.0f;
+            s_dmin = (max_min > 0.0f) ? (max_min / 63.0f) : 0.0f;
+            s_inv_scale = (max_scale > 0.0f) ? (63.0f / max_scale) : 0.0f;
+            s_inv_min = (max_min > 0.0f) ? (63.0f / max_min) : 0.0f;
+        }
+
+        __syncthreads();
+
+        if (warp_id < 8) {
+            const float gscale = s_scales[warp_id];
+            const float gmin_pos = s_mins[warp_id];
+
+            int ls = (int)(s_inv_scale * gscale + 0.5f);
+            int lm = (int)(s_inv_min * gmin_pos + 0.5f);
+            if (ls < 0) ls = 0; if (ls > 63) ls = 63;
+            if (lm < 0) lm = 0; if (lm > 63) lm = 63;
+
+            const float d = s_d;
+            const float dmin = s_dmin;
+            const float d_group = d * (float)ls;
+            const float dm_group = dmin * (float)lm;
+            const float inv_d = (d_group > 1e-10f) ? (1.0f / d_group) : 0.0f;
+
+            const int base = block * 256 + warp_id * 32;
+            const float val = smem_fq[base + lane];
+            
+            // Asymmetric quant: q = (val + min) / scale
+            int q = (int)((val + dm_group) * inv_d + 0.5f);
+            if (q < 0) q = 0;
+            if (q > 15) q = 15;
+
+            // Map 0..15 to -8..7 for signed storage
+            const int q_signed = q - 8;
+            const int q_4bit = q_signed & 0xF;
+
+            const int pair_idx = lane & 15;
+            const int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
+            const int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
+            const int packed = lo | (hi << 4);
+
+            const int group = block * 8 + warp_id;
+            if (lane < 16) {
+                qs[batch_idx * (N / 2) + group * 16 + pair_idx] = (uint8_t)packed;
+            }
+
+            if (lane == 0) {
+                const float scale = d_group;
+                const float offset = 8.0f * scale - dm_group;
+                scales[batch_idx * groups + group] = __float2half(scale);
+                mins[batch_idx * groups + group] = __float2half(offset);
+            }
+        }
+
+        __syncthreads();
+    }
+}
+
+__global__ void fwht_quantize_kernel_chunked(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ qs,
+    half* __restrict__ scales,
+    half* __restrict__ mins,
+    int n,
+    int batch_size)
+{
+    extern __shared__ float smem_chunk[];
     
-    for (int group = warp_id; group < groups; group += num_warps) {
-        const int base = group * 32;
-        float val = smem_fq[base + lane];
+    const int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    
+    const float* x_row = x + batch_idx * n;
+    const int groups_total = n / 32;
+    
+    const int step = n & -n;
+    const int num_chunks = n / step;
+    const float scale_fwht = rsqrtf((float)step);
+    
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int blocks_per_chunk = step / 256;
+
+    __shared__ float s_scales[8];
+    __shared__ float s_mins[8];
+    __shared__ float s_d;
+    __shared__ float s_dmin;
+    __shared__ float s_inv_scale;
+    __shared__ float s_inv_min;
+
+    for (int chunk = 0; chunk < num_chunks; chunk++) {
+        const int base_n = chunk * step;
         
-        // Asymmetric quantization: find min and max (matching Q4_K)
-        float vmin = val;
-        float vmax = val;
-        #pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1) {
-            vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
-            vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
+        // Load into shared memory
+        for (int i = threadIdx.x; i < step; i += blockDim.x) {
+            smem_chunk[i] = x_row[base_n + i];
+        }
+        __syncthreads();
+        
+        // FWHT in-place for chunk
+        for (int h = 1; h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = threadIdx.x; i < step / 2; i += blockDim.x) {
+                const int block = i / h;
+                const int offset = i % h;
+                const int idx1 = block * stride + offset;
+                const int idx2 = idx1 + h;
+                fwht_butterfly(smem_chunk[idx1], smem_chunk[idx2]);
+            }
+            __syncthreads();
         }
         
-        // Q4_K style: if min > 0, set to 0 (so min represents negative values)
-        if (vmin > 0) vmin = 0;
-        const float qmin = -vmin;  // Store as positive value
-        const float range = vmax - vmin;
-        const float qscale = range / 15.0f;
-        const float inv_scale = (qscale > 1e-10f) ? (1.0f / qscale) : 0.0f;
-        
-        // Quantize to unsigned [0, 15], then convert to signed [-8, 7]
-        int q_unsigned = __float2int_rn((val - vmin) * inv_scale);
-        q_unsigned = max(0, min(15, q_unsigned));
-        // Convert to signed: subtract 8
-        int q_signed = q_unsigned - 8;
-        // Store as 2's complement: mask to 4 bits
-        int q_4bit = q_signed & 0xF;
-        
-        const int pair_idx = lane % 16;
-        int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
-        int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
-        int packed = lo | (hi << 4);
-        
-        if (lane < 16) {
-            qs[batch_idx * (N / 2) + group * 16 + pair_idx] = (uint8_t)packed;
+        // Apply scale
+        for (int i = threadIdx.x; i < step; i += blockDim.x) {
+            smem_chunk[i] *= scale_fwht;
         }
-        
-        if (lane == 0) {
-            scales[batch_idx * groups + group] = __float2half(qscale);
-            // Store the offset needed in dequant: 8*scale - min (matching weight conversion)
-            float offset = 8.0f * qscale - qmin;
-            mins[batch_idx * groups + group] = __float2half(offset);
+        __syncthreads();
+
+        // Quantize chunk
+        for (int block = 0; block < blocks_per_chunk; ++block) {
+            if (warp_id < 8) {
+                const int base_s = block * 256 + warp_id * 32;
+                float val = smem_chunk[base_s + lane];
+
+                float vmin = val;
+                float vmax = val;
+                #pragma unroll
+                for (int mask = 16; mask > 0; mask >>= 1) {
+                    vmin = fminf(vmin, __shfl_xor_sync(0xFFFFFFFF, vmin, mask));
+                    vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFF, vmax, mask));
+                }
+
+                if (vmin > 0) vmin = 0;
+                const float gscale = (vmax - vmin) / 15.0f;
+                const float gmin_pos = -vmin;
+
+                if (lane == 0) {
+                    s_scales[warp_id] = gscale;
+                    s_mins[warp_id] = gmin_pos;
+                }
+            }
+
+            __syncthreads();
+
+            if (threadIdx.x == 0) {
+                float max_scale = s_scales[0];
+                float max_min = s_mins[0];
+                #pragma unroll
+                for (int i = 1; i < 8; i++) {
+                    if (s_scales[i] > max_scale) max_scale = s_scales[i];
+                    if (s_mins[i] > max_min) max_min = s_mins[i];
+                }
+
+                s_d = (max_scale > 0.0f) ? (max_scale / 63.0f) : 0.0f;
+                s_dmin = (max_min > 0.0f) ? (max_min / 63.0f) : 0.0f;
+                s_inv_scale = (max_scale > 0.0f) ? (63.0f / max_scale) : 0.0f;
+                s_inv_min = (max_min > 0.0f) ? (63.0f / max_min) : 0.0f;
+            }
+
+            __syncthreads();
+
+            if (warp_id < 8) {
+                const float gscale = s_scales[warp_id];
+                const float gmin_pos = s_mins[warp_id];
+
+                int ls = (int)(s_inv_scale * gscale + 0.5f);
+                int lm = (int)(s_inv_min * gmin_pos + 0.5f);
+                if (ls < 0) ls = 0; if (ls > 63) ls = 63;
+                if (lm < 0) lm = 0; if (lm > 63) lm = 63;
+
+                const float d = s_d;
+                const float dmin = s_dmin;
+                const float d_group = d * (float)ls;
+                const float dm_group = dmin * (float)lm;
+                const float inv_d = (d_group > 1e-10f) ? (1.0f / d_group) : 0.0f;
+
+                const int base_s = block * 256 + warp_id * 32;
+                const float val = smem_chunk[base_s + lane];
+                int q = (int)((val + dm_group) * inv_d + 0.5f);
+                if (q < 0) q = 0;
+                if (q > 15) q = 15;
+
+                const int q_signed = q - 8;
+                const int q_4bit = q_signed & 0xF;
+
+                const int pair_idx = lane & 15;
+                const int lo = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx);
+                const int hi = __shfl_sync(0xFFFFFFFF, q_4bit, pair_idx + 16);
+                const int packed = lo | (hi << 4);
+
+                const int group_idx = (chunk * blocks_per_chunk + block) * 8 + warp_id;
+                if (lane < 16) {
+                    qs[batch_idx * (n / 2) + group_idx * 16 + pair_idx] = (uint8_t)packed;
+                }
+
+                if (lane == 0) {
+                    const float scale = d_group;
+                    const float offset = 8.0f * scale - dm_group;
+                    scales[batch_idx * groups_total + group_idx] = __float2half(scale);
+                    mins[batch_idx * groups_total + group_idx] = __float2half(offset);
+                }
+            }
+            __syncthreads();
         }
     }
 }
@@ -394,32 +728,44 @@ void ggml_cuda_rrs_fwht_quantize(
     int batch_size,
     cudaStream_t stream)
 {
-    const size_t smem_size = n * sizeof(float);
-    const int threads = min(256, n);
-    
-    switch (n) {
-        case 256:
-            fwht_quantize_kernel<256><<<batch_size, threads, smem_size, stream>>>(
-                x, (uint8_t*)y, scales, mins, batch_size);
-            break;
-        case 512:
-            fwht_quantize_kernel<512><<<batch_size, threads, smem_size, stream>>>(
-                x, (uint8_t*)y, scales, mins, batch_size);
-            break;
-        case 1024:
-            fwht_quantize_kernel<1024><<<batch_size, threads, smem_size, stream>>>(
-                x, (uint8_t*)y, scales, mins, batch_size);
-            break;
-        case 2048:
-            fwht_quantize_kernel<2048><<<batch_size, 512, smem_size, stream>>>(
-                x, (uint8_t*)y, scales, mins, batch_size);
-            break;
-        case 4096:
-            fwht_quantize_kernel<4096><<<batch_size, 512, smem_size, stream>>>(
-                x, (uint8_t*)y, scales, mins, batch_size);
-            break;
-        default:
-            break;
+    if ((n & (n - 1)) == 0) {
+        const size_t smem_size = n * sizeof(float);
+        const int threads = min(256, n);
+        
+        switch (n) {
+            case 256:
+                fwht_quantize_kernel<256><<<batch_size, threads, smem_size, stream>>>(
+                    x, (uint8_t*)y, scales, mins, batch_size);
+                break;
+            case 512:
+                fwht_quantize_kernel<512><<<batch_size, threads, smem_size, stream>>>(
+                    x, (uint8_t*)y, scales, mins, batch_size);
+                break;
+            case 1024:
+                fwht_quantize_kernel<1024><<<batch_size, threads, smem_size, stream>>>(
+                    x, (uint8_t*)y, scales, mins, batch_size);
+                break;
+            case 2048:
+                fwht_quantize_kernel<2048><<<batch_size, 512, smem_size, stream>>>(
+                    x, (uint8_t*)y, scales, mins, batch_size);
+                break;
+            case 4096:
+                fwht_quantize_kernel<4096><<<batch_size, 512, smem_size, stream>>>(
+                    x, (uint8_t*)y, scales, mins, batch_size);
+                break;
+            case 8192:
+                fwht_quantize_kernel<8192><<<batch_size, 512, smem_size, stream>>>(
+                    x, (uint8_t*)y, scales, mins, batch_size);
+                break;
+            default:
+                fprintf(stderr, "[RRS CUDA] Error: Unsupported FWHT size N=%d\n", n);
+                break;
+        }
+    } else {
+        const int step = n & -n;
+        const size_t smem_size = step * sizeof(float);
+        fwht_quantize_kernel_chunked<<<batch_size, min(256, step), smem_size, stream>>>(
+            x, (uint8_t*)y, scales, mins, n, batch_size);
     }
 }
 
@@ -442,7 +788,9 @@ void ggml_cuda_rrs_quantize_act(
 #define RRS_HAS_INT4_TC 1
 #endif
 
+#ifdef RRS_HAS_INT4_TC
 using I4 = wmma::experimental::precision::s4;
+#endif
 
 // ============================================================================
 // QuadMul-style INT4 WMMA GEMM with 2-Stage Async Pipeline
@@ -762,6 +1110,7 @@ __global__ void __launch_bounds__(256) rrs_gemm_i4_async_kernel(
 // ============================================================================
 
 // WMMA tile dimensions for INT4: 8x8x32
+#ifdef RRS_HAS_INT4_TC
 constexpr int WMMA_M = 8;
 constexpr int WMMA_N = 8;
 constexpr int WMMA_K = 32;
@@ -771,6 +1120,7 @@ constexpr int BLOCK_WARPS_M = 4;
 constexpr int BLOCK_WARPS_N = 4;
 constexpr int WARP_TILES_M = 2;
 constexpr int WARP_TILES_N = 4;
+#endif
 
 template<int TILE_M, int TILE_N, int TILE_K>
 __global__ void __launch_bounds__(256) rrs_gemm_i4_kernel_legacy(
@@ -942,6 +1292,211 @@ inline void rrs_gemm_i4_dispatch(
 //            = scale_a * scale_w * C_i32 + scale_a * offset_w * sum_q_a
 // 
 // For simplicity, we approximate with average scales (per-group tracking would be more accurate)
+__global__ void rrs_mmvq_q4_k_accurate_kernel(
+    const uint8_t* __restrict__ A,      // [K/2] packed activations
+    const void*    __restrict__ B,      // [N, K/256] block_q4_K weights
+    float*         __restrict__ C,      // [N] output
+    const half*    __restrict__ a_scales,
+    const half*    __restrict__ a_mins,
+    const int N, const int K)
+{
+    const int i = blockIdx.x; // row in B = output feature index
+    if (i >= N) return;
+
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+
+    const block_q4_K* blocks_w = (const block_q4_K*)B + i * (K / 256);
+    float total_sum = 0.0f;
+
+    for (int b = tid; b < K / 256; b += n_threads) {
+        const block_q4_K& wb = blocks_w[b];
+        const float d_w = __half2float(wb.dm.x);
+        const float dmin_w = __half2float(wb.dm.y);
+
+        uint8_t sc_w[8], mn_w[8];
+        unpack_scales_mins_k4_cuda(wb.scales, sc_w, mn_w);
+
+        for (int g = 0; g < 8; g++) {
+            const float scale_w = d_w * (float)sc_w[g];
+            const float offset_w = 8.0f * scale_w - dmin_w * (float)mn_w[g];
+
+            const float scale_a = __half2float(a_scales[b * 8 + g]);
+            const float offset_a = __half2float(a_mins[b * 8 + g]);
+
+            const int p = g / 2;
+            const uint8_t* qs_w = wb.qs + p * 32;
+            const bool is_hi = (g % 2 != 0);
+            const uint8_t* qs_a = A + (b * 256 + g * 32) / 2;
+
+            int dot_i32 = 0;
+            int sum_q_a = 0;
+            int sum_q_w = 0;
+
+            #pragma unroll
+            for (int l = 0; l < 16; l++) {
+                const uint8_t p_a = qs_a[l];
+                const uint8_t p_w_lo = qs_w[l];
+                const uint8_t p_w_hi = qs_w[l + 16];
+
+                // Activations (A): Packed signed 4-bit integers [-8, 7]
+                // Need sign extension from 4 bits
+                int q_a_lo = (p_a & 0x0F); if (q_a_lo >= 8) q_a_lo -= 16;
+                int q_a_hi = (p_a >> 4);   if (q_a_hi >= 8) q_a_hi -= 16;
+
+                // Weights (B): Packed unsigned 4-bit integers [0, 15]
+                // Need to subtract 8 to center at 0
+                const int q_w_lo = (int)(is_hi ? (p_w_lo >> 4) : (p_w_lo & 0x0F)) - 8;
+                const int q_w_hi = (int)(is_hi ? (p_w_hi >> 4) : (p_w_hi & 0x0F)) - 8;
+
+                dot_i32 += q_a_lo * q_w_lo + q_a_hi * q_w_hi;
+                sum_q_a += q_a_lo + q_a_hi;
+                sum_q_w += q_w_lo + q_w_hi;
+            }
+
+            total_sum += scale_a * scale_w * (float)dot_i32;
+            total_sum += scale_a * offset_w * (float)sum_q_a;
+            total_sum += scale_w * offset_a * (float)sum_q_w;
+            total_sum += offset_a * offset_w * 32.0f;
+        }
+    }
+
+    // Reduction
+    __shared__ float s_part[32];
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+
+    float warp_sum = total_sum;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        warp_sum += __shfl_xor_sync(0xffffffff, warp_sum, mask);
+    }
+
+    if (lane == 0) s_part[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (tid < 32) {
+        float final_sum = (tid < (n_threads / 32)) ? s_part[tid] : 0.0f;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            final_sum += __shfl_xor_sync(0xffffffff, final_sum, mask);
+        }
+        if (tid == 0) C[i] = final_sum;
+    }
+}
+
+__global__ void rrs_gemm_accurate_kernel(
+    const uint8_t* __restrict__ A,      // [M, K/2] packed activations
+    const void*    __restrict__ B,      // [N, K/256] block_q4_K weights
+    float*         __restrict__ C,      // [M, N] output
+    const half*    __restrict__ a_scales,
+    const half*    __restrict__ a_mins,
+    const int M, const int N, const int K)
+{
+    const int col = blockIdx.x; // N
+    const int row = blockIdx.y; // M
+    
+    if (col >= N || row >= M) return;
+
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+
+    const block_q4_K* blocks_w = (const block_q4_K*)B + col * (K / 256);
+    
+    // Pointers for this row of A
+    const uint8_t* A_row = A + row * (K / 2);
+    const half* a_scales_row = a_scales + row * (K / 32);
+    const half* a_mins_row = a_mins + row * (K / 32);
+
+    float total_sum = 0.0f;
+
+    for (int b = tid; b < K / 256; b += n_threads) {
+        const block_q4_K& wb = blocks_w[b];
+        const float d_w = __half2float(wb.dm.x);
+        const float dmin_w = __half2float(wb.dm.y);
+
+        uint8_t sc_w[8], mn_w[8];
+        unpack_scales_mins_k4_cuda(wb.scales, sc_w, mn_w);
+
+        for (int g = 0; g < 8; g++) {
+            const float scale_w = d_w * (float)sc_w[g];
+            const float offset_w = 8.0f * scale_w - dmin_w * (float)mn_w[g];
+
+            const float scale_a = __half2float(a_scales_row[b * 8 + g]);
+            const float offset_a = __half2float(a_mins_row[b * 8 + g]);
+
+            const int p = g / 2;
+            const uint8_t* qs_w = wb.qs + p * 32;
+            const bool is_hi = (g % 2 != 0);
+            const uint8_t* qs_a = A_row + (b * 256 + g * 32) / 2;
+
+            int dot_i32 = 0;
+            int sum_q_a = 0;
+            int sum_q_w = 0;
+
+            #pragma unroll
+            for (int l = 0; l < 16; l++) {
+                const uint8_t p_a = qs_a[l];
+                const uint8_t p_w_lo = qs_w[l];
+                const uint8_t p_w_hi = qs_w[l + 16];
+
+                // Activations (A): Packed signed 4-bit integers [-8, 7]
+                int q_a_lo = (p_a & 0x0F); if (q_a_lo >= 8) q_a_lo -= 16;
+                int q_a_hi = (p_a >> 4);   if (q_a_hi >= 8) q_a_hi -= 16;
+
+                // Weights (B): Packed unsigned 4-bit integers [0, 15]
+                // Need to subtract 8 to center at 0
+                const int q_w_lo = (int)(is_hi ? (p_w_lo >> 4) : (p_w_lo & 0x0F)) - 8;
+                const int q_w_hi = (int)(is_hi ? (p_w_hi >> 4) : (p_w_hi & 0x0F)) - 8;
+
+                dot_i32 += q_a_lo * q_w_lo + q_a_hi * q_w_hi;
+                sum_q_a += q_a_lo + q_a_hi;
+                sum_q_w += q_w_lo + q_w_hi;
+            }
+
+            total_sum += scale_a * scale_w * (float)dot_i32;
+            total_sum += scale_a * offset_w * (float)sum_q_a;
+            total_sum += scale_w * offset_a * (float)sum_q_w;
+            total_sum += offset_a * offset_w * 32.0f;
+
+#if RRS_DEBUG
+            if (row == 0 && col == 0 && tid == 0 && b == 0 && g == 0) {
+                // Debug print for first group of first block
+                printf("[RRS KERNEL] b=0 g=0: scale_a=%f sum_q_a=%d | scale_w=%f offset_w=%f sum_q_w=%d | dot_i32=%d term1=%f term2=%f\n",
+                    scale_a, sum_q_a,
+                    scale_w, offset_w, sum_q_w,
+                    dot_i32,
+                    scale_a * scale_w * (float)dot_i32,
+                    scale_a * offset_w * (float)sum_q_a);
+            }
+#endif
+        }
+    }
+
+    // Reduction
+    __shared__ float s_part[32];
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+
+    float warp_sum = total_sum;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        warp_sum += __shfl_xor_sync(0xffffffff, warp_sum, mask);
+    }
+
+    if (lane == 0) s_part[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (tid < 32) {
+        float final_sum = (tid < (n_threads / 32)) ? s_part[tid] : 0.0f;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            final_sum += __shfl_xor_sync(0xffffffff, final_sum, mask);
+        }
+        if (tid == 0) C[row * N + col] = final_sum;
+    }
+}
+
 __global__ void rrs_dequant_simple_kernel(
     const int* __restrict__ C_i32,
     float* __restrict__ C_f32,
@@ -959,47 +1514,35 @@ __global__ void rrs_dequant_simple_kernel(
     const int sum_i32 = C_i32[row * N + col];
     const int groups = K / 32;
     
-    // Compute average activation scale and offset (asymmetric quantization)
+    float correction_term = 0.0f;
     float avg_act_scale = 0.0f;
-    float avg_act_offset = 0.0f;
-    for (int g = 0; g < groups; g++) {
-        avg_act_scale += __half2float(act_scales[row * groups + g]);
-        if (act_mins != nullptr) {
-            avg_act_offset += __half2float(act_mins[row * groups + g]);
-        }
-    }
-    avg_act_scale /= groups;
-    avg_act_offset /= groups;
-    
-    // Compute average weight scale and offset
     float avg_weight_scale = 0.0f;
-    float avg_weight_offset = 0.0f;
-    if (weight_scales != nullptr) {
-        for (int g = 0; g < groups; g++) {
-            avg_weight_scale += __half2float(weight_scales[col * groups + g]);
-            if (weight_mins != nullptr) {
-                avg_weight_offset += __half2float(weight_mins[col * groups + g]);
-            }
-        }
-        avg_weight_scale /= groups;
-        avg_weight_offset /= groups;
-    } else {
-        avg_weight_scale = 0.125f;  // Default fallback
+
+    // Loop over groups to compute average scales and the cross-term correction
+    for (int g = 0; g < groups; g++) {
+        float s_a = __half2float(act_scales[row * groups + g]);
+        float s_w = __half2float(weight_scales[col * groups + g]);
+        
+        // act_mins stores (scale_a * sum_q_a)
+        // weight_mins stores offset_w
+        // correction = sum( (scale_a * sum_q_a) * offset_w )
+        float term_a = __half2float(act_mins[row * groups + g]); 
+        float term_w = __half2float(weight_mins[col * groups + g]);
+        
+        correction_term += term_a * term_w;
+        
+        avg_act_scale += s_a;
+        avg_weight_scale += s_w;
     }
     
-    // Dequantization for asymmetric quantization:
-    // Both act and weight use: val = scale * q_signed + offset
-    // where q_signed = q_unsigned - 8, and offset = 8*scale - min
-    // 
-    // Dot product: sum(val_a * val_w) = sum((scale_a * q_a + offset_a) * (scale_w * q_w + offset_w))
-    // = scale_a * scale_w * sum(q_a * q_w)           [main GEMM term]
-    // + scale_a * offset_w * sum(q_a)                [cross term 1]
-    // + scale_w * offset_a * sum(q_w)                [cross term 2]  
-    // + offset_a * offset_w * K                      [bias term]
-    //
-    // Simplified approximation: main term + bias term (cross terms small for centered data)
-    float result = (float)sum_i32 * avg_act_scale * avg_weight_scale;
-    result += avg_act_offset * avg_weight_offset * (float)(K / 32);  // K/32 = elements per group
+    avg_act_scale /= groups;
+    avg_weight_scale /= groups;
+    
+    // Result = sum_i32 * avg_s_a * avg_s_w + correction_term
+    // We use average scales for the main dot product as an approximation (standard block quantization)
+    // But we add the exact correction term for the cross product
+    
+    float result = (float)sum_i32 * avg_act_scale * avg_weight_scale + correction_term;
     
     C_f32[row * N + col] = result;
 }
@@ -1241,7 +1784,7 @@ __global__ void rrs_gemm_q8_dp4a_kernel(
     for (int k = 0; k < K; k += 4) {
         int a_packed = *reinterpret_cast<const int*>(&A[row * K + k]);
         int b_packed = *reinterpret_cast<const int*>(&B[col * K + k]);
-        sum = __dp4a(a_packed, b_packed, sum);
+        sum = ggml_cuda_dp4a(a_packed, b_packed, sum);
     }
     
     C[row * N + col] = sum;
@@ -1339,6 +1882,105 @@ void ggml_cuda_rrs_gemm_q4_via_q8(
 // Dispatch Integration
 // ============================================================================
 
+extern "C" void ggml_quantize_row_q4_K_rrs_act(const float * x, void * y, int64_t k);
+
+__global__ void rrs_gemm_q4k_q4k_kernel(
+    const void* __restrict__ A,      // [M, K/256] block_q4_K activations
+    const void* __restrict__ B,      // [N, K/256] block_q4_K weights
+    float*      __restrict__ C,      // [M, N] output
+    const int M, const int N, const int K)
+{
+    const int col = blockIdx.x; // N
+    const int row = blockIdx.y; // M
+    
+    if (col >= N || row >= M) return;
+
+    const int tid = threadIdx.x;
+    const int n_threads = blockDim.x;
+
+    const block_q4_K* blocks_a = (const block_q4_K*)A + row * (K / 256);
+    const block_q4_K* blocks_w = (const block_q4_K*)B + col * (K / 256);
+    
+    float total_sum = 0.0f;
+
+    for (int b = tid; b < K / 256; b += n_threads) {
+        const block_q4_K& ab = blocks_a[b];
+        const block_q4_K& wb = blocks_w[b];
+
+        // Unpack A
+        const float d_a = __half2float(ab.dm.x);
+        const float dmin_a = __half2float(ab.dm.y);
+        uint8_t sc_a[8], mn_a[8];
+        unpack_scales_mins_k4_cuda(ab.scales, sc_a, mn_a);
+
+        // Unpack B (Weights)
+        const float d_w = __half2float(wb.dm.x);
+        const float dmin_w = __half2float(wb.dm.y);
+        uint8_t sc_w[8], mn_w[8];
+        unpack_scales_mins_k4_cuda(wb.scales, sc_w, mn_w);
+
+        for (int g = 0; g < 8; g++) {
+            const int p = g / 2;
+            const bool is_hi = (g % 2 != 0);
+            
+            const uint8_t* qs_a_ptr = ab.qs + p * 32;
+            const uint8_t* qs_w_ptr = wb.qs + p * 32;
+
+            int dot_qq = 0;
+            int sum_qa = 0;
+            int sum_qw = 0;
+
+            #pragma unroll
+            for (int l = 0; l < 16; l++) {
+                const uint8_t pa_0 = qs_a_ptr[l];
+                const uint8_t pa_1 = qs_a_ptr[l+16];
+                const uint8_t pw_0 = qs_w_ptr[l];
+                const uint8_t pw_1 = qs_w_ptr[l+16];
+                
+                int qa0 = (int)(is_hi ? (pa_0 >> 4) : (pa_0 & 0x0F));
+                int qa1 = (int)(is_hi ? (pa_1 >> 4) : (pa_1 & 0x0F));
+                
+                int qw0 = (int)(is_hi ? (pw_0 >> 4) : (pw_0 & 0x0F));
+                int qw1 = (int)(is_hi ? (pw_1 >> 4) : (pw_1 & 0x0F));
+                
+                dot_qq += qa0 * qw0 + qa1 * qw1;
+                sum_qa += qa0 + qa1;
+                sum_qw += qw0 + qw1;
+            }
+
+            // Exactly match CPU formula:
+            // S = (da*dw)*sum(dot_qq*sc_a*sc_w) - (da*dmin_w)*sum(sum_qa*sc_a*mn_w) - (dw*dmin_a)*sum(sum_qw*sc_w*mn_a) + (dmin_a*dmin_w)*32*mn_a*mn_w
+            total_sum += (d_a * d_w) * (float)(dot_qq * (int)sc_a[g] * sc_w[g]);
+            total_sum -= (d_a * dmin_w) * (float)(sum_qa * (int)sc_a[g] * mn_w[g]);
+            total_sum -= (d_w * dmin_a) * (float)(sum_qw * (int)sc_w[g] * mn_a[g]);
+            total_sum += (dmin_a * dmin_w) * 32.0f * (float)((int)mn_a[g] * mn_w[g]);
+        }
+    }
+
+    // Reduction
+    __shared__ float s_part[32];
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+
+    float warp_sum = total_sum;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        warp_sum += __shfl_xor_sync(0xffffffff, warp_sum, mask);
+    }
+
+    if (lane == 0) s_part[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (tid < 32) {
+        float final_sum = (tid < (n_threads / 32)) ? s_part[tid] : 0.0f;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            final_sum += __shfl_xor_sync(0xffffffff, final_sum, mask);
+        }
+        if (tid == 0) C[row * N + col] = final_sum;
+    }
+}
+
 void ggml_cuda_rrs_mul_mat(
     ggml_backend_cuda_context& ctx,
     const ggml_tensor* src0,  // weights (Q4_K_RRS)
@@ -1358,115 +2000,57 @@ void ggml_cuda_rrs_mul_mat(
     
     cudaStream_t stream = ctx.stream();
     
-    static int call_count = 0;
-    call_count++;
+    // CPU Quantization Path
     
-#if RRS_DEBUG
-    if (call_count <= 3) {
-        fprintf(stderr, "[RRS CUDA] mul_mat call #%d: M=%d, N=%d, K=%d\n", call_count, M, N, K);
+    // 1. Copy src1 (activations) to host (src1 is on GPU)
+    size_t src1_size = M * K * sizeof(float);
+    float* h_src1 = (float*)malloc(src1_size);
+    if (!h_src1) {
+        fprintf(stderr, "[RRS CUDA] Failed to allocate host buffer for src1\n");
+        return;
     }
-#endif
     
-    const int groups_act = M * (K / 32);
-    const int groups_wgt = N * (K / 32);
-    
-    // Allocate temporary buffers for activations
-    uint8_t* act_q4;
-    half *act_scales, *act_mins;
-    
-    cudaMallocAsync(&act_q4, M * K / 2, stream);
-    cudaMallocAsync(&act_scales, groups_act * sizeof(half), stream);
-    cudaMallocAsync(&act_mins, groups_act * sizeof(half), stream);
-    
-    // Allocate temporary buffers for extracted weight data
-    uint8_t* wgt_q4_packed;
-    half *wgt_scales, *wgt_mins;
-    
-    cudaMallocAsync(&wgt_q4_packed, N * K / 2, stream);
-    cudaMallocAsync(&wgt_scales, groups_wgt * sizeof(half), stream);
-    cudaMallocAsync(&wgt_mins, groups_wgt * sizeof(half), stream);
-    
-    // Get source pointers
-    const float* src1_f32 = (const float*)src1->data;
-    const void* src0_q4k = src0->data;
-    float* dst_f32 = (float*)dst->data;
-    
-    // Step 1: Extract packed INT4 quants and scales from Q4_K blocks
-    // Q4_K layout: [dm(4B), scales(12B), qs(128B)] per 256-element block
-    const int total_blocks = N * (K / 256);
-    const int extract_threads = 256;
-    const int extract_blocks = (total_blocks + extract_threads - 1) / extract_threads;
-    
-    extract_q4k_quants_kernel<<<extract_blocks, extract_threads, 0, stream>>>(
-        src0_q4k, wgt_q4_packed, wgt_scales, wgt_mins, N, K);
-    
-    // Step 2: FWHT + Quantize activations (fused)
-    ggml_cuda_rrs_fwht_quantize(src1_f32, act_q4, act_scales, act_mins, K, M, stream);
-    
-#if RRS_DEBUG
-    if (call_count <= 3) {
-        cudaStreamSynchronize(stream);
-        
-        // Check a few activation values (INPUT to FWHT)
-        float h_act[4];
-        cudaMemcpy(h_act, src1_f32, 4*sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RRS CUDA] First 4 activation floats (pre-FWHT): %f %f %f %f\n", h_act[0], h_act[1], h_act[2], h_act[3]);
-        
-        // Check quantized activations (after FWHT+quantize)
-        uint8_t h_act_q[4];
-        cudaMemcpy(h_act_q, act_q4, 4, cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RRS CUDA] First 4 act_q4 bytes (post-FWHT): 0x%02x 0x%02x 0x%02x 0x%02x\n", h_act_q[0], h_act_q[1], h_act_q[2], h_act_q[3]);
-        
-        // Decode the signed INT4 values to verify they're reasonable
-        int q0_lo = (h_act_q[0] & 0xF); if (q0_lo >= 8) q0_lo -= 16;  // 2's complement
-        int q0_hi = (h_act_q[0] >> 4);  if (q0_hi >= 8) q0_hi -= 16;
-        int q1_lo = (h_act_q[1] & 0xF); if (q1_lo >= 8) q1_lo -= 16;
-        int q1_hi = (h_act_q[1] >> 4);  if (q1_hi >= 8) q1_hi -= 16;
-        fprintf(stderr, "[RRS CUDA] Decoded act_q4 first 4 values: %d %d %d %d\n", q0_lo, q0_hi, q1_lo, q1_hi);
-        
-        // Check act scales
-        half h_scales[2];
-        cudaMemcpy(h_scales, act_scales, 2*sizeof(half), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RRS CUDA] First 2 act_scales: %f %f\n", __half2float(h_scales[0]), __half2float(h_scales[1]));
-        
-        // Check weight quants  
-        uint8_t h_wgt_q[4];
-        cudaMemcpy(h_wgt_q, wgt_q4_packed, 4, cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RRS CUDA] First 4 wgt_q4 bytes: 0x%02x 0x%02x 0x%02x 0x%02x\n", h_wgt_q[0], h_wgt_q[1], h_wgt_q[2], h_wgt_q[3]);
-        
-        // Check weight scales
-        half h_wgt_scales[2];
-        cudaMemcpy(h_wgt_scales, wgt_scales, 2*sizeof(half), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RRS CUDA] First 2 wgt_scales: %f %f\n", __half2float(h_wgt_scales[0]), __half2float(h_wgt_scales[1]));
+    // Handle non-contiguous src1 if necessary, though activations are usually contiguous
+    if (src1->nb[1] == (size_t)K * sizeof(float)) {
+        cudaMemcpy(h_src1, src1->data, src1_size, cudaMemcpyDeviceToHost);
+    } else {
+        for (int i = 0; i < M; i++) {
+            cudaMemcpy(h_src1 + i * K, (const char*)src1->data + i * src1->nb[1], K * sizeof(float), cudaMemcpyDeviceToHost);
+        }
     }
-#endif
     
-    // Step 3: INT4 GEMM with proper scale arrays
-    ggml_cuda_rrs_gemm_q4q4(
-        act_q4, wgt_q4_packed, dst_f32,
-        M, N, K,
-        act_scales, act_mins,
-        wgt_scales, wgt_mins,
-        stream);
+    // 2. Allocate host buffer for quantized activations
+    size_t row_size = ggml_row_size(GGML_TYPE_Q4_K_RRS_ACT, K);
+    size_t total_size = M * row_size;
     
-#if RRS_DEBUG
-    if (call_count <= 3) {
-        cudaStreamSynchronize(stream);
-        
-        // Check output
-        float h_out[4];
-        cudaMemcpy(h_out, dst_f32, 4*sizeof(float), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[RRS CUDA] First 4 output floats: %f %f %f %f\n", h_out[0], h_out[1], h_out[2], h_out[3]);
+    void* h_act_q4k = malloc(total_size);
+    if (!h_act_q4k) {
+        fprintf(stderr, "[RRS CUDA] Failed to allocate host buffer for act_q4k\n");
+        free(h_src1);
+        return;
     }
-#endif
     
+    // 3. Quantize on CPU (includes RRS transform)
+    uint8_t* dst_ptr = (uint8_t*)h_act_q4k;
+    for (int i = 0; i < M; i++) {
+        ggml_quantize_row_q4_K_rrs_act(h_src1 + i * K, dst_ptr + i * row_size, K);
+    }
+    
+    // 4. Copy to GPU
+    void* d_act_q4k;
+    cudaMallocAsync(&d_act_q4k, total_size, stream);
+    cudaMemcpyAsync(d_act_q4k, h_act_q4k, total_size, cudaMemcpyHostToDevice, stream);
+    
+    // 5. Run Kernel
+    dim3 grid(N, M);
+    rrs_gemm_q4k_q4k_kernel<<<grid, 256, 0, stream>>>(
+        d_act_q4k, src0->data, (float*)dst->data, M, N, K);
+        
     // Cleanup
-    cudaFreeAsync(act_q4, stream);
-    cudaFreeAsync(act_scales, stream);
-    cudaFreeAsync(act_mins, stream);
-    cudaFreeAsync(wgt_q4_packed, stream);
-    cudaFreeAsync(wgt_scales, stream);
-    cudaFreeAsync(wgt_mins, stream);
+    cudaFreeAsync(d_act_q4k, stream);
+    cudaStreamSynchronize(stream);
+    free(h_src1);
+    free(h_act_q4k);
 }
 
 // Check if RRS path should be used
@@ -1489,7 +2073,7 @@ bool ggml_cuda_supports_rrs(const ggml_tensor* tensor) {
 // Benchmark Infrastructure
 // ============================================================================
 
-#define CUDA_CHECK(call) do { \
+#define RRS_CHECK(call) do { \
     cudaError_t err = (call); \
     if (err != cudaSuccess) { \
         printf("CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
@@ -1503,7 +2087,7 @@ void ggml_cuda_rrs_benchmark(
     RRSBenchmarkResult* result)
 {
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    RRS_CHECK(cudaStreamCreate(&stream));
     
     // Allocate test data
     float *h_A, *h_B;
@@ -1518,21 +2102,21 @@ void ggml_cuda_rrs_benchmark(
     uint8_t *d_A_q4, *d_B_q4;
     half *d_scales_A, *d_mins_A, *d_scales_B, *d_mins_B;
     
-    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_B, N * K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_A_q4, M * K / 2));
-    CUDA_CHECK(cudaMalloc(&d_B_q4, N * K / 2));
+    RRS_CHECK(cudaMalloc(&d_A, M * K * sizeof(float)));
+    RRS_CHECK(cudaMalloc(&d_B, N * K * sizeof(float)));
+    RRS_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
+    RRS_CHECK(cudaMalloc(&d_A_q4, M * K / 2));
+    RRS_CHECK(cudaMalloc(&d_B_q4, N * K / 2));
     
     const int groups_A = M * (K / 32);
     const int groups_B = N * (K / 32);
-    CUDA_CHECK(cudaMalloc(&d_scales_A, groups_A * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_mins_A, groups_A * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_scales_B, groups_B * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_mins_B, groups_B * sizeof(half)));
+    RRS_CHECK(cudaMalloc(&d_scales_A, groups_A * sizeof(half)));
+    RRS_CHECK(cudaMalloc(&d_mins_A, groups_A * sizeof(half)));
+    RRS_CHECK(cudaMalloc(&d_scales_B, groups_B * sizeof(half)));
+    RRS_CHECK(cudaMalloc(&d_mins_B, groups_B * sizeof(half)));
     
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, M * K * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, N * K * sizeof(float), cudaMemcpyHostToDevice));
+    RRS_CHECK(cudaMemcpy(d_A, h_A, M * K * sizeof(float), cudaMemcpyHostToDevice));
+    RRS_CHECK(cudaMemcpy(d_B, h_B, N * K * sizeof(float), cudaMemcpyHostToDevice));
     
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -1544,8 +2128,8 @@ void ggml_cuda_rrs_benchmark(
         ggml_cuda_rrs_fwht(d_A, d_A, K, M, stream);
     }
     cudaEventRecord(stop, stream);
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaGetLastError());
+    RRS_CHECK(cudaEventSynchronize(stop));
+    RRS_CHECK(cudaGetLastError());
     cudaEventElapsedTime(&result->fwht_time_ms, start, stop);
     result->fwht_time_ms /= iterations;
     
@@ -1555,15 +2139,15 @@ void ggml_cuda_rrs_benchmark(
         ggml_cuda_rrs_fwht_quantize(d_A, d_A_q4, d_scales_A, d_mins_A, K, M, stream);
     }
     cudaEventRecord(stop, stream);
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaGetLastError());
+    RRS_CHECK(cudaEventSynchronize(stop));
+    RRS_CHECK(cudaGetLastError());
     cudaEventElapsedTime(&result->quantize_time_ms, start, stop);
     result->quantize_time_ms /= iterations;
     
     // Pre-quantize B for GEMM benchmark
     ggml_cuda_rrs_fwht_quantize(d_B, d_B_q4, d_scales_B, d_mins_B, K, N, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaGetLastError());
+    RRS_CHECK(cudaStreamSynchronize(stream));
+    RRS_CHECK(cudaGetLastError());
     
     // Benchmark INT4 WMMA GEMM
     cudaEventRecord(start, stream);
@@ -1576,8 +2160,8 @@ void ggml_cuda_rrs_benchmark(
             stream);
     }
     cudaEventRecord(stop, stream);
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaGetLastError());
+    RRS_CHECK(cudaEventSynchronize(stop));
+    RRS_CHECK(cudaGetLastError());
     cudaEventElapsedTime(&result->int4_wmma_time_ms, start, stop);
     result->int4_wmma_time_ms /= iterations;
     
@@ -1592,8 +2176,8 @@ void ggml_cuda_rrs_benchmark(
             stream);
     }
     cudaEventRecord(stop, stream);
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaGetLastError());
+    RRS_CHECK(cudaEventSynchronize(stop));
+    RRS_CHECK(cudaGetLastError());
     cudaEventElapsedTime(&result->q8_repack_time_ms, start, stop);
     result->q8_repack_time_ms /= iterations;
     
