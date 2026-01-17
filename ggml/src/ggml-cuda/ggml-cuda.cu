@@ -60,6 +60,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/rrs.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2180,6 +2181,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // RRS (Rotated Runtime Smooth) W4A4 path - uses INT4 tensor cores
+    if (src0->type == GGML_TYPE_Q4_K_RRS && ggml_cuda_supports_rrs(src0)) {
+        ggml_cuda_rrs_mul_mat(ctx, src0, src1, dst);
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -4415,6 +4422,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_Q4_K_RRS:  // RRS W4A4 with INT4 tensor cores
                         return true;
                     default:
                         return false;
