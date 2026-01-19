@@ -4,7 +4,7 @@
 #include <cuda_fp16.h>
 
 // ============================================================================
-// TCQ4-K32: Tensor Core Native INT4 Format
+// TCQ4-K32: Tensor Core Native INT4 Format with Channel Reordering
 // ============================================================================
 //
 // Block structure (256 weights = 8 groups × 32):
@@ -26,6 +26,26 @@
 #define TCQ4_K32_NUM_GROUPS 8
 #define TCQ4_K32_GROUP_SIZE 32
 #define TCQ4_K32_BYTES_PER_BLOCK 148  // 128 + 4 + 16
+
+// ============================================================================
+// Channel Reordering Support (RRS Paper Section 3.2)
+// ============================================================================
+// Channel reordering groups outlier channels together to improve Runtime Smooth
+// effectiveness. Permutation is computed offline from calibration data and
+// stored in GGUF metadata. At runtime, activations are permuted before FWHT.
+//
+// GGUF keys:
+//   "tcq4.reorder.enabled" (bool): Whether model uses channel reordering
+//   "tcq4.{tensor_name}.perm" (int32[]): Permutation indices for tensor
+//
+// Example: For blk.0.attn_q.weight, key is "tcq4.blk.0.attn_q.weight.perm"
+
+// Structure to hold permutation data for a tensor
+struct tcq4_channel_perm {
+    int32_t* d_perm;      // Device pointer to permutation indices [K]
+    int K;                // Number of channels (input dimension)
+    bool valid;           // Whether permutation is loaded/valid
+};
 
 // ============================================================================
 // Conversion Functions
@@ -203,6 +223,45 @@ void tcq4_rrs_gemm_imma(
     cudaStream_t stream);
 
 // ============================================================================
+// Channel Permutation Kernels
+// ============================================================================
+
+// Apply channel permutation to FP32 activations (before FWHT)
+// Input:  x[M, K] - original activations (row-major)
+// Output: y[M, K] - permuted activations where y[m, i] = x[m, perm[i]]
+// perm:   [K] - permutation indices
+void tcq4_apply_channel_perm(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int32_t* __restrict__ perm,
+    int M, int K,
+    cudaStream_t stream);
+
+// Fused permutation + FWHT + Runtime Smooth + INT4 quantization
+// Combines permutation with existing RRS pipeline for efficiency
+// Input:  x[M, K] - original FP32 activations
+// Output: y[M, K/256] - block_rrs_int4_tc blocks
+// perm:   [K] - permutation indices (NULL for identity/no permutation)
+void tcq4_rrs_perm_fwht_quantize_tc(
+    const float* __restrict__ x,
+    void* __restrict__ y,
+    const int32_t* __restrict__ perm,  // Can be NULL for no permutation
+    int K,
+    int batch_size,
+    cudaStream_t stream);
+
+// Reorder weight columns during quantization (offline)
+// Input:  w[N, K] - original weights (row-major, N output channels)
+// Output: w_reordered[N, K] - permuted where w_reordered[n, i] = w[n, perm[i]]
+// perm:   [K] - permutation indices
+// Note: This is done on CPU during quantization, not runtime
+void tcq4_reorder_weight_columns(
+    const float* w,
+    float* w_reordered,
+    const int32_t* perm,
+    int N, int K);
+
+// ============================================================================
 // Device Helper Functions
 // ============================================================================
 
@@ -369,3 +428,23 @@ void tcq4_k32_print_benchmark(const TCQ4BenchResult* result);
 
 // Validate TCQ4_K32 conversion correctness
 bool tcq4_k32_validate_conversion(int num_blocks, cudaStream_t stream);
+
+// ============================================================================
+// Calibration & Permutation Generation (for quantization tool)
+// ============================================================================
+
+// Compute channel permutation from activation statistics
+// channel_max[K]: maximum absolute activation value per channel (from calibration)
+// perm[K]: output permutation indices (argsort descending by channel_max)
+void tcq4_compute_channel_perm(
+    const float* channel_max,
+    int32_t* perm,
+    int K);
+
+// Update channel statistics from a batch of activations
+// x[M, K]: activation batch
+// channel_max[K]: running max absolute value per channel (updated in-place)
+void tcq4_update_channel_stats(
+    const float* x,
+    float* channel_max,
+    int M, int K);

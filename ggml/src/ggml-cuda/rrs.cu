@@ -3,6 +3,76 @@
 #include "vecdotq.cuh"
 #include "tcq4_k32.cuh"
 
+#include <mutex>
+
+// ============================================================================
+// Channel Permutation Registry (RRS Paper Section 3.2)
+// ============================================================================
+// Stores device pointers to channel permutations, keyed by tensor name.
+// Thread-safe for registration/lookup.
+
+static std::unordered_map<std::string, int32_t*> g_perm_registry;
+static std::mutex g_perm_mutex;
+static bool g_reorder_enabled = false;
+
+void ggml_cuda_rrs_register_perm(
+    const char* tensor_name,
+    const int32_t* h_perm,
+    int K
+) {
+    std::lock_guard<std::mutex> lock(g_perm_mutex);
+    
+    // Free existing permutation if any
+    auto it = g_perm_registry.find(tensor_name);
+    if (it != g_perm_registry.end()) {
+        cudaFree(it->second);
+    }
+    
+    // Allocate and copy to device
+    int32_t* d_perm = nullptr;
+    cudaMalloc(&d_perm, K * sizeof(int32_t));
+    cudaMemcpy(d_perm, h_perm, K * sizeof(int32_t), cudaMemcpyHostToDevice);
+    
+    g_perm_registry[tensor_name] = d_perm;
+    
+    fprintf(stderr, "[TCQ4] Registered channel permutation for %s (K=%d)\n", tensor_name, K);
+}
+
+const int32_t* ggml_cuda_rrs_get_perm(const char* tensor_name) {
+    std::lock_guard<std::mutex> lock(g_perm_mutex);
+    
+    auto it = g_perm_registry.find(tensor_name);
+    if (it != g_perm_registry.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+bool ggml_cuda_rrs_has_perm(const char* tensor_name) {
+    std::lock_guard<std::mutex> lock(g_perm_mutex);
+    return g_perm_registry.find(tensor_name) != g_perm_registry.end();
+}
+
+void ggml_cuda_rrs_clear_perms() {
+    std::lock_guard<std::mutex> lock(g_perm_mutex);
+    
+    for (auto& kv : g_perm_registry) {
+        cudaFree(kv.second);
+    }
+    g_perm_registry.clear();
+    
+    fprintf(stderr, "[TCQ4] Cleared all channel permutations\n");
+}
+
+void ggml_cuda_rrs_set_reorder_enabled(bool enabled) {
+    g_reorder_enabled = enabled;
+    fprintf(stderr, "[TCQ4] Channel reordering %s\n", enabled ? "enabled" : "disabled");
+}
+
+bool ggml_cuda_rrs_get_reorder_enabled() {
+    return g_reorder_enabled;
+}
+
 // For test functions - CPU quantize/dequantize
 extern "C" {
 #include "ggml-quants.h"
@@ -2283,22 +2353,33 @@ void ggml_cuda_rrs_mul_mat(ggml_backend_cuda_context& ctx, const ggml_tensor* sr
     // Key insight: divide by group-max BEFORE quantization, multiply AFTER dot product
     if (src0->type == GGML_TYPE_TCQ4_K32) {
         static int tcq4_call_count = 0;
+        
+        // Check for channel permutation (RRS paper Section 3.2)
+        // Permutation is pre-computed from calibration data and stored in GGUF
+        const int32_t* d_perm = nullptr;
+        if (g_reorder_enabled) {
+            d_perm = ggml_cuda_rrs_get_perm(src0->name);
+        }
+        
         if (tcq4_call_count < 3) {
 #if TCQ4_USE_RRS_W4A4
-            fprintf(stderr, "[TCQ4-RRS-W4A4] mul_mat M=%d N=%d K=%d\n", M, N, K);
+            fprintf(stderr, "[TCQ4-RRS-W4A4] mul_mat M=%d N=%d K=%d perm=%s\n", 
+                    M, N, K, d_perm ? "yes" : "no");
 #else
-            fprintf(stderr, "[TCQ4-W4A8] mul_mat M=%d N=%d K=%d\n", M, N, K);
+            fprintf(stderr, "[TCQ4-W4A8] mul_mat M=%d N=%d K=%d perm=%s\n", 
+                    M, N, K, d_perm ? "yes" : "no");
 #endif
             tcq4_call_count++;
         }
         
 #if TCQ4_USE_RRS_W4A4
         // Runtime Smooth W4A4 path (paper's approach)
-        // 1. FWHT to spread spike outliers
-        // 2. Runtime Smooth: divide by group-max, store scale separately
-        // 3. Quantize normalized values to INT4
-        // 4. Dot product with TCQ4 weights (using tensor cores if enabled)
-        // 5. Multiply by smooth scale to restore magnitude
+        // 1. (Optional) Apply channel permutation to activations
+        // 2. FWHT to spread spike outliers
+        // 3. Runtime Smooth: divide by group-max, store scale separately
+        // 4. Quantize normalized values to INT4
+        // 5. Dot product with TCQ4 weights (using tensor cores if enabled)
+        // 6. Multiply by smooth scale to restore magnitude
         const int num_k_blocks = K / TCQ4_K32_BLOCK_SIZE;
         
 #if TCQ4_USE_TENSOR_CORES
@@ -2308,8 +2389,9 @@ void ggml_cuda_rrs_mul_mat(ggml_backend_cuda_context& ctx, const ggml_tensor* sr
         size_t rrs_actual;
         void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
         
-        // Fused FWHT + Runtime Smooth + INT4 quantize (with group sums for tensor cores)
-        tcq4_rrs_fwht_quantize_tc((const float*)src1->data, d_act_rrs, K, M, stream);
+        // Fused (permutation +) FWHT + Runtime Smooth + INT4 quantize
+        // If d_perm is NULL, no permutation is applied (identity)
+        tcq4_rrs_perm_fwht_quantize_tc((const float*)src1->data, d_act_rrs, d_perm, K, M, stream);
         
         // Dispatch GEMM/GEMV with tensor cores
         if (M == 1) {

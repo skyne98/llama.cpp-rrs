@@ -2249,3 +2249,232 @@ bool tcq4_k32_validate_conversion(int num_blocks, cudaStream_t stream) {
     // Just verify the conversion runs without errors
     return true;
 }
+
+// ============================================================================
+// Channel Permutation Kernels (RRS Paper Section 3.2)
+// ============================================================================
+// Channel reordering groups outlier channels together to improve Runtime Smooth.
+// Permutation is computed offline from calibration data and stored in GGUF.
+// At runtime, activations are permuted before FWHT to match reordered weights.
+
+// Kernel to apply channel permutation to FP32 activations
+// y[m, i] = x[m, perm[i]] for all m in [0, M) and i in [0, K)
+__global__ void tcq4_apply_channel_perm_kernel(
+    const float* __restrict__ x,      // [M, K] input activations
+    float* __restrict__ y,            // [M, K] output (permuted)
+    const int32_t* __restrict__ perm, // [K] permutation indices
+    int M, int K
+) {
+    const int m = blockIdx.y;
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (m < M && k < K) {
+        y[m * K + k] = x[m * K + perm[k]];
+    }
+}
+
+void tcq4_apply_channel_perm(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    const int32_t* __restrict__ perm,
+    int M, int K,
+    cudaStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((K + block.x - 1) / block.x, M);
+    tcq4_apply_channel_perm_kernel<<<grid, block, 0, stream>>>(x, y, perm, M, K);
+}
+
+// Fused permutation + FWHT + Runtime Smooth + INT4 quantization
+// This avoids an extra memory pass by fusing permutation into the FWHT load
+__global__ void tcq4_rrs_perm_fwht_quantize_tc_kernel(
+    const float* __restrict__ x,      // [batch_size, K] input
+    block_rrs_int4_tc* __restrict__ y, // [batch_size, K/256] output blocks
+    const int32_t* __restrict__ perm, // [K] permutation (can be NULL)
+    int K,
+    int batch_size
+) {
+    extern __shared__ float smem[];
+    
+    const int row = blockIdx.x;
+    if (row >= batch_size) return;
+    
+    const float* x_row = x + row * K;
+    const int num_blocks = K / TCQ4_K32_BLOCK_SIZE;
+    
+    // Load with optional permutation
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        int src_idx = perm ? perm[i] : i;
+        smem[i] = x_row[src_idx];
+    }
+    __syncthreads();
+    
+    // FWHT transform with step=256 (TCQ4 block size)
+    const int step = TCQ4_K32_BLOCK_SIZE;
+    const float fwht_scale = rsqrtf((float)step);  // 1/16
+    
+    for (int chunk_base = 0; chunk_base < K; chunk_base += step) {
+        // Butterfly stages
+        for (int h = 1; h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = threadIdx.x; i < step / 2; i += blockDim.x) {
+                const int block_idx = i / h;
+                const int offset = i % h;
+                const int idx1 = chunk_base + block_idx * stride + offset;
+                const int idx2 = idx1 + h;
+                float a = smem[idx1];
+                float b = smem[idx2];
+                smem[idx1] = a + b;
+                smem[idx2] = a - b;
+            }
+            __syncthreads();
+        }
+        // Normalize
+        for (int i = threadIdx.x; i < step; i += blockDim.x) {
+            smem[chunk_base + i] *= fwht_scale;
+        }
+        __syncthreads();
+    }
+    
+    // Runtime Smooth + INT4 quantization per 256-element block
+    block_rrs_int4_tc* y_row = y + row * num_blocks;
+    
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp_id = tid / 32;
+    const int num_warps = blockDim.x / 32;
+    
+    for (int blk = warp_id; blk < num_blocks; blk += num_warps) {
+        float* block_data = smem + blk * TCQ4_K32_BLOCK_SIZE;
+        
+        // Find block max for runtime smooth scale
+        float local_max = 0.0f;
+        for (int i = lane; i < TCQ4_K32_BLOCK_SIZE; i += 32) {
+            local_max = fmaxf(local_max, fabsf(block_data[i]));
+        }
+        // Warp reduce
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, mask));
+        }
+        
+        const float smooth_scale = local_max;
+        const float inv_scale = (smooth_scale > 0.0f) ? (7.0f / smooth_scale) : 0.0f;
+        
+        // Quantize to INT4 and compute per-group sums
+        block_rrs_int4_tc& out = y_row[blk];
+        
+        if (lane == 0) {
+            out.smooth_scale = smooth_scale;
+        }
+        
+        // Process 8 groups of 32 elements each
+        for (int g = 0; g < 8; g++) {
+            int32_t group_sum = 0;
+            
+            // Each lane handles 1 element per iteration, 32 elements total
+            for (int i = lane; i < 32; i += 32) {
+                float val = block_data[g * 32 + i];
+                int8_t q = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(val * inv_scale)));
+                group_sum += q;
+                
+                // Pack INT4 values (pairs of adjacent elements)
+                // Lane 0,1,2,...,15 handle even/odd pairs
+                if (i < 16) {
+                    float val0 = block_data[g * 32 + i * 2];
+                    float val1 = block_data[g * 32 + i * 2 + 1];
+                    int8_t q0 = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(val0 * inv_scale)));
+                    int8_t q1 = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(val1 * inv_scale)));
+                    out.qs[g * 16 + i] = ((uint8_t)(q1 & 0xF) << 4) | ((uint8_t)(q0 & 0xF));
+                }
+            }
+            
+            // Reduce group sum within warp (only need lanes 0-31 which all participate)
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                group_sum += __shfl_xor_sync(0xffffffff, group_sum, mask);
+            }
+            
+            if (lane == 0) {
+                out.sum_q[g] = (int16_t)group_sum;
+            }
+        }
+    }
+}
+
+void tcq4_rrs_perm_fwht_quantize_tc(
+    const float* __restrict__ x,
+    void* __restrict__ y,
+    const int32_t* __restrict__ perm,
+    int K,
+    int batch_size,
+    cudaStream_t stream
+) {
+    size_t smem_size = K * sizeof(float);
+    int threads = min(256, K);
+    
+    tcq4_rrs_perm_fwht_quantize_tc_kernel<<<batch_size, threads, smem_size, stream>>>(
+        x, (block_rrs_int4_tc*)y, perm, K, batch_size
+    );
+}
+
+// ============================================================================
+// CPU Functions for Calibration & Quantization
+// ============================================================================
+
+// Reorder weight columns (CPU, during quantization)
+// w_reordered[n, i] = w[n, perm[i]]
+void tcq4_reorder_weight_columns(
+    const float* w,
+    float* w_reordered,
+    const int32_t* perm,
+    int N, int K
+) {
+    for (int n = 0; n < N; n++) {
+        for (int k = 0; k < K; k++) {
+            w_reordered[n * K + k] = w[n * K + perm[k]];
+        }
+    }
+}
+
+// Compute channel permutation from activation statistics (CPU)
+// Sorts channels by channel_max in descending order (outliers first)
+void tcq4_compute_channel_perm(
+    const float* channel_max,
+    int32_t* perm,
+    int K
+) {
+    // Initialize identity permutation
+    for (int k = 0; k < K; k++) {
+        perm[k] = k;
+    }
+    
+    // Sort by channel_max descending (simple insertion sort, O(K^2) but K is typically small)
+    // For large K, should use std::sort with custom comparator
+    for (int i = 1; i < K; i++) {
+        int32_t key = perm[i];
+        float key_val = channel_max[key];
+        int j = i - 1;
+        while (j >= 0 && channel_max[perm[j]] < key_val) {
+            perm[j + 1] = perm[j];
+            j--;
+        }
+        perm[j + 1] = key;
+    }
+}
+
+// Update channel statistics from a batch of activations (CPU)
+// channel_max[k] = max(channel_max[k], max_m(|x[m,k]|))
+void tcq4_update_channel_stats(
+    const float* x,
+    float* channel_max,
+    int M, int K
+) {
+    for (int k = 0; k < K; k++) {
+        float col_max = channel_max[k];
+        for (int m = 0; m < M; m++) {
+            col_max = fmaxf(col_max, fabsf(x[m * K + k]));
+        }
+        channel_max[k] = col_max;
+    }
+}

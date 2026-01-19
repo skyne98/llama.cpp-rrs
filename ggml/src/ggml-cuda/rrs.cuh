@@ -2,6 +2,8 @@
 
 #include "common.cuh"
 #include <mma.h>
+#include <unordered_map>
+#include <string>
 
 // ============================================================================
 // RRS (Rotated Runtime Smooth) CUDA Kernels
@@ -133,3 +135,33 @@ void ggml_cuda_rrs_print_benchmark(const RRSBenchmarkResult * result);
 
 // Simple test function - verifies CUDA RRS kernels work
 extern "C" void ggml_cuda_rrs_test(void);
+
+// ============================================================================
+// Channel Permutation Support (RRS Paper Section 3.2)
+// ============================================================================
+// Channel reordering groups outlier channels together to improve Runtime Smooth.
+// Permutations are loaded from GGUF metadata and stored in a registry.
+
+// Register a channel permutation for a tensor (called during model load)
+// tensor_name: name of the weight tensor (e.g., "blk.0.attn_q.weight")
+// h_perm: host pointer to permutation indices [K]
+// K: number of channels
+// Copies permutation to device memory
+void ggml_cuda_rrs_register_perm(
+    const char* tensor_name,
+    const int32_t* h_perm,
+    int K);
+
+// Get device pointer to channel permutation for a tensor
+// Returns NULL if no permutation registered for this tensor
+const int32_t* ggml_cuda_rrs_get_perm(const char* tensor_name);
+
+// Check if channel reordering is enabled for a tensor
+bool ggml_cuda_rrs_has_perm(const char* tensor_name);
+
+// Clear all registered permutations (called on model unload)
+void ggml_cuda_rrs_clear_perms();
+
+// Get/set global flag for whether to use channel reordering
+void ggml_cuda_rrs_set_reorder_enabled(bool enabled);
+bool ggml_cuda_rrs_get_reorder_enabled();
