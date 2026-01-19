@@ -305,6 +305,26 @@ typedef struct {
 } block_q4_K;
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2, "wrong q4_K block size/padding");
 
+// TCQ4-K32: Tensor Core native INT4 format
+// 256 weights = 8 groups × 32 elements, matching IMMA m16n8k32 K dimension
+// Weights stored in IMMA-friendly packed order (no runtime repack needed)
+// w = s_g * q + z_g, where s_g = S * qs[g], z_g = Z * qz[g]
+// Storage: 128 + 20 = 148 bytes / 256 weights = 4.625 bits/weight
+#define TCQ4_K32_BLOCK_SIZE 256
+#define TCQ4_K32_NUM_GROUPS 8
+#define TCQ4_K32_GROUP_SIZE 32
+typedef struct {
+    // 256 signed int4 weights packed in IMMA tile order (8 int4 per uint32)
+    // Layout: ready for mma.sync.m16n8k32.s32.s4.s4.s32 without shuffle
+    uint8_t qs[TCQ4_K32_BLOCK_SIZE / 2];  // 128 bytes
+    // Double-quantized metadata (Q4_K-style)
+    ggml_half S;                           // scale-of-scales
+    ggml_half Z;                           // scale-of-zeros
+    int8_t sc[TCQ4_K32_NUM_GROUPS];        // per-group scale codes
+    int8_t zc[TCQ4_K32_NUM_GROUPS];        // per-group zero/offset codes
+} block_tcq4_k32;
+static_assert(sizeof(block_tcq4_k32) == TCQ4_K32_BLOCK_SIZE/2 + 2*sizeof(ggml_half) + 2*TCQ4_K32_NUM_GROUPS, "wrong tcq4_k32 block size/padding");
+
 // 5-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b

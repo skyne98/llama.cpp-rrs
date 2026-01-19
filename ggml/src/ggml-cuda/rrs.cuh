@@ -67,6 +67,15 @@ void ggml_cuda_rrs_fwht(
     int batch_size,
     cudaStream_t stream);
 
+// TCQ4-specific FWHT with fixed step=256 (for embedding inverse transform)
+// TCQ4_K32 is quantized with 256-element FWHT chunks, so inverse must match
+void ggml_cuda_tcq4_fwht_step256(
+    const float * x,       // input [batch_size, n]
+    float * y,             // output [batch_size, n]
+    int n,                 // dimension (must be multiple of 256)
+    int batch_size,
+    cudaStream_t stream);
+
 // Activation quantization (F32 -> Q4 packed with per-32-group scales)
 void ggml_cuda_rrs_quantize_act(
     const float * x,

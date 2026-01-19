@@ -429,7 +429,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_Q4_K_RRS = 40,
         GGML_TYPE_Q4_K_RRS_ACT = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TCQ4_K32 = 42, // Tensor Core INT4, K=32 groups, IMMA-native layout
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision
@@ -466,6 +467,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q4_K_RRS = 39, // RRS (Rotated Runtime Smooth) INT4
+        GGML_FTYPE_MOSTLY_TCQ4_K32 = 40, // TCQ4-K32 Tensor Core native INT4
     };
 
     // available tensor operations:

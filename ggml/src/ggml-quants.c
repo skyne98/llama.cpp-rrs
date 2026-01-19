@@ -2,6 +2,7 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "ggml-common.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -12,6 +13,9 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+
+// FWHT from rrs.c (used for TCQ4_K32 quantization)
+extern void ggml_fwht_impl(float * data, int n);
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -1347,6 +1351,122 @@ void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_REST
 
         x += QK_K;
     }
+}
+
+// TCQ4-K32: Tensor Core native INT4 dequantization
+void dequantize_row_tcq4_k32(const block_tcq4_k32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TCQ4_K32_BLOCK_SIZE == 0);
+    const int64_t nb = k / TCQ4_K32_BLOCK_SIZE;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float S = GGML_FP16_TO_FP32(x[i].S);
+        const float Z = GGML_FP16_TO_FP32(x[i].Z);
+
+        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
+            const float scale = S * (float)x[i].sc[g];
+            const float zero = Z * (float)x[i].zc[g];
+
+            for (int j = 0; j < TCQ4_K32_GROUP_SIZE; j += 2) {
+                const int idx = g * TCQ4_K32_GROUP_SIZE + j;
+                const uint8_t byte = x[i].qs[idx / 2];
+
+                int8_t v0 = (int8_t)(byte & 0x0F);
+                v0 = (v0 >= 8) ? (v0 - 16) : v0;
+                int8_t v1 = (int8_t)((byte >> 4) & 0x0F);
+                v1 = (v1 >= 8) ? (v1 - 16) : v1;
+
+                y[i * TCQ4_K32_BLOCK_SIZE + idx] = scale * (float)v0 + zero;
+                y[i * TCQ4_K32_BLOCK_SIZE + idx + 1] = scale * (float)v1 + zero;
+            }
+        }
+    }
+}
+
+// TCQ4-K32: Quantization reference implementation
+void quantize_row_tcq4_k32_ref(const float * GGML_RESTRICT x, block_tcq4_k32 * GGML_RESTRICT y, int64_t k) {
+    assert(k % TCQ4_K32_BLOCK_SIZE == 0);
+    const int64_t nb = k / TCQ4_K32_BLOCK_SIZE;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i * TCQ4_K32_BLOCK_SIZE;
+
+        // Find per-group scales (symmetric quantization)
+        float scales[TCQ4_K32_NUM_GROUPS];
+        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
+            float max_abs = 0.0f;
+            for (int j = 0; j < TCQ4_K32_GROUP_SIZE; j++) {
+                float v = fabsf(xb[g * TCQ4_K32_GROUP_SIZE + j]);
+                if (v > max_abs) max_abs = v;
+            }
+            scales[g] = max_abs / 7.0f;  // INT4 range: [-8, 7]
+            if (scales[g] < 1e-10f) scales[g] = 1.0f;
+        }
+
+        // Find scale-of-scales
+        float max_scale = 0.0f;
+        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
+            if (scales[g] > max_scale) max_scale = scales[g];
+        }
+        float S_f = (max_scale > 0.0f) ? (max_scale / 127.0f) : 1.0f;
+
+        y[i].S = GGML_FP32_TO_FP16(S_f);
+        y[i].Z = GGML_FP32_TO_FP16(0.0f);  // Symmetric quantization
+
+        // Quantize scales and values
+        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
+            y[i].sc[g] = (int8_t)roundf(scales[g] / S_f);
+            y[i].zc[g] = 0;
+
+            float inv_scale = 1.0f / scales[g];
+
+            for (int j = 0; j < TCQ4_K32_GROUP_SIZE; j += 2) {
+                float v0 = xb[g * TCQ4_K32_GROUP_SIZE + j];
+                float v1 = xb[g * TCQ4_K32_GROUP_SIZE + j + 1];
+
+                int8_t q0 = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(v0 * inv_scale)));
+                int8_t q1 = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(v1 * inv_scale)));
+
+                y[i].qs[(g * TCQ4_K32_GROUP_SIZE + j) / 2] = ((uint8_t)(q1 & 0x0F) << 4) | ((uint8_t)(q0 & 0x0F));
+            }
+        }
+    }
+}
+
+// TCQ4-K32: Quantization with FWHT (like Q4_K_RRS)
+// For RRS W4A4, weights must be FWHT'd before symmetric quantization
+size_t quantize_tcq4_k32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);  // TODO: use importance matrix
+    size_t row_size = ggml_row_size(GGML_TYPE_TCQ4_K32, n_per_row);
+    
+    // Allocate scratch buffer for FWHT
+    float * scratch = (float *)malloc(n_per_row * sizeof(float));
+    if (!scratch) {
+        // Fallback: quantize without FWHT (will produce worse results)
+        for (int64_t row = 0; row < nrow; ++row) {
+            quantize_row_tcq4_k32_ref(src + row * n_per_row, (block_tcq4_k32 *)((char *)dst + row * row_size), n_per_row);
+        }
+        return nrow * row_size;
+    }
+    
+    // TCQ4_K32 uses 256-element blocks, so FWHT must be applied in 256-element chunks
+    // This matches the CUDA kernel's fwht_256_shared() which does FWHT per block
+    const int step = TCQ4_K32_BLOCK_SIZE;  // Always 256, matching CUDA kernel
+    
+    for (int64_t row = 0; row < nrow; ++row) {
+        // Copy row to scratch
+        memcpy(scratch, src + row * n_per_row, n_per_row * sizeof(float));
+        
+        // Apply FWHT in 256-element chunks (must match CUDA kernel)
+        for (int i = 0; i < n_per_row; i += step) {
+            ggml_fwht_impl(scratch + i, step);
+        }
+        
+        // Quantize FWHT'd data
+        quantize_row_tcq4_k32_ref(scratch, (block_tcq4_k32 *)((char *)dst + row * row_size), n_per_row);
+    }
+    
+    free(scratch);
+    return nrow * row_size;
 }
 
 void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -5238,6 +5358,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_K_RRS_ACT:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_K, data, nb, d, dmin);
+            } break;
+        case GGML_TYPE_TCQ4_K32:
+            {
+                // TCQ4-K32: validate S and Z (fp16 scale-of-scales and scale-of-zeros)
+                const block_tcq4_k32 * q = (const block_tcq4_k32 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].S, i)) {
+                        return false;
+                    }
+                    if (!validate_fp16(q[i].Z, i)) {
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {

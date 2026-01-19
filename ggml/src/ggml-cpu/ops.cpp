@@ -4797,6 +4797,31 @@ void ggml_compute_forward_get_rows(
                     }
                 }
             } break;
+        case GGML_TYPE_TCQ4_K32:
+            {
+                ggml_compute_forward_get_rows_q(params, dst);
+
+                const int64_t ne0 = dst->ne[0];
+                if (ne0 > 0) {
+                    const int64_t nr = ggml_nelements(dst->src[1]);
+                    const int ith = params->ith;
+                    const int nth = params->nth;
+                    const int dr = (nr + nth - 1)/nth;
+                    const int ir0 = dr*ith;
+                    const int ir1 = (int)MIN(ir0 + dr, nr);
+
+                    // TCQ4_K32 uses fixed step=256 for FWHT (matches block size during quantization)
+                    // This is different from Q4_K_RRS which uses step = ne0 & -ne0
+                    const int step = 256;
+
+                    float * data = (float *) dst->data;
+                    for (int64_t i = ir0; i < ir1; ++i) {
+                        for (int j = 0; j < ne0; j += step) {
+                            ggml_fwht_impl(data + i * ne0 + j, step);
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_Q4_K_RRS_ACT:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:

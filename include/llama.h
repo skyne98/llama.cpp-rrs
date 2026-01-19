@@ -153,6 +153,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q4_K_RRS      = 39, // RRS (Rotated Runtime Smooth) INT4
+        LLAMA_FTYPE_MOSTLY_TCQ4_K32      = 40, // TCQ4-K32 Tensor Core native INT4
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };

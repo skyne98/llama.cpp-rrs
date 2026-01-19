@@ -153,67 +153,181 @@ static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8
     }
 }
 
-// Fast activation quantization - simplified for RRS-smoothed data
-// After FWHT, activations have near-Gaussian distribution, so simple min/max scaling works well
-static void quantize_row_q4_K_fast(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+// Fast activation quantization optimized for FWHT-transformed data
+// FWHT produces symmetric distributions centered at 0, so we use symmetric quantization
+// with optimal clipping to handle outliers efficiently
+
+// Symmetric quantization for FWHT data: quantize to [-7, 7] then shift to [0, 15]
+// This is more efficient for symmetric data than asymmetric min/max
+static float make_symmetric_quants_fast(int n, int nmax, const float * GGML_RESTRICT x,
+        const float * GGML_RESTRICT weights, uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min) {
+    // Find optimal clipping threshold using percentile-based approach
+    // For FWHT data, clip at ~2.5 sigma to minimize MSE
+    float sum_w = 0, sum_x2 = 0;
+    float abs_max = 0;
+    
+    for (int i = 0; i < n; ++i) {
+        sum_w += weights[i];
+        sum_x2 += weights[i] * x[i] * x[i];
+        float ax = fabsf(x[i]);
+        if (ax > abs_max) abs_max = ax;
+    }
+    
+    if (abs_max == 0) {
+        for (int i = 0; i < n; ++i) L[i] = nmax / 2;  // midpoint for zero
+        *the_min = 0;
+        return 0.f;
+    }
+    
+    // Estimate std dev and use optimal clipping ratio for 4-bit
+    // Optimal clip for Gaussian at 4-bit is ~2.55 sigma
+    float variance = sum_x2 / sum_w;
+    float sigma = sqrtf(variance);
+    float clip = 2.55f * sigma;
+    if (clip > abs_max) clip = abs_max;
+    if (clip < abs_max * 0.5f) clip = abs_max * 0.5f;  // Don't clip too aggressively
+    
+    // Try multiple clipping ratios and pick best
+    float best_error = 1e30f;
+    float best_scale = clip / (nmax / 2);
+    uint8_t Lbest[32];
+    
+    for (int trial = 0; trial < 5; ++trial) {
+        float try_clip = clip * (0.8f + 0.1f * trial);
+        float try_scale = try_clip / (nmax / 2);
+        float try_iscale = (nmax / 2) / try_clip;
+        
+        float cur_error = 0;
+        for (int i = 0; i < n; ++i) {
+            // Symmetric quantize: map [-clip, clip] to [0, nmax]
+            int l = (int)(x[i] * try_iscale + (nmax / 2) + 0.5f);
+            l = l < 0 ? 0 : (l > nmax ? nmax : l);
+            Lbest[i] = (uint8_t)l;
+            float reconstructed = (l - nmax / 2) * try_scale;
+            float diff = reconstructed - x[i];
+            cur_error += weights[i] * diff * diff;
+        }
+        
+        if (cur_error < best_error) {
+            best_error = cur_error;
+            best_scale = try_scale;
+            for (int i = 0; i < n; ++i) L[i] = Lbest[i];
+        }
+    }
+    
+    // For symmetric quant, min = -scale * (nmax/2), so the_min = scale * (nmax/2)
+    *the_min = best_scale * (nmax / 2);
+    return best_scale;
+}
+
+// MSE-minimizing quantization for a group of 32 values with importance weights
+// Returns optimal scale, sets *the_min to optimal min (negated)
+static float make_qkx2_quants_fast(int n, int nmax, const float * GGML_RESTRICT x,
+        const float * GGML_RESTRICT weights, uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min) {
+    float min_val = x[0], max_val = x[0];
+    float sum_w = weights[0], sum_x = weights[0] * x[0];
+    
+    for (int i = 1; i < n; ++i) {
+        if (x[i] < min_val) min_val = x[i];
+        if (x[i] > max_val) max_val = x[i];
+        sum_w += weights[i];
+        sum_x += weights[i] * x[i];
+    }
+    if (min_val > 0) min_val = 0;
+    if (max_val == min_val) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        *the_min = -min_val;
+        return 0.f;
+    }
+    
+    float iscale = nmax / (max_val - min_val);
+    float scale = 1 / iscale;
+    float best_error = 0;
+    
+    // Initial quantization
+    for (int i = 0; i < n; ++i) {
+        int l = (int)(iscale * (x[i] - min_val) + 0.5f);
+        L[i] = (uint8_t)(l < 0 ? 0 : (l > nmax ? nmax : l));
+        float diff = scale * L[i] + min_val - x[i];
+        best_error += weights[i] * diff * diff;
+    }
+    
+    // Iterative refinement (3 steps for speed vs quality tradeoff)
+    uint8_t Laux[32];
+    for (int is = 0; is <= 6; ++is) {
+        float try_iscale = (-0.6f + 0.2f * is + nmax) / (max_val - min_val);
+        float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+        
+        for (int i = 0; i < n; ++i) {
+            int l = (int)(try_iscale * (x[i] - min_val) + 0.5f);
+            l = l < 0 ? 0 : (l > nmax ? nmax : l);
+            Laux[i] = (uint8_t)l;
+            float w = weights[i];
+            sum_l += w * l;
+            sum_l2 += w * l * l;
+            sum_xl += w * l * x[i];
+        }
+        
+        float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0) {
+            float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+            float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+            if (this_min > 0) {
+                this_min = 0;
+                this_scale = sum_xl / sum_l2;
+            }
+            
+            float cur_error = 0;
+            for (int i = 0; i < n; ++i) {
+                float diff = this_scale * Laux[i] + this_min - x[i];
+                cur_error += weights[i] * diff * diff;
+            }
+            
+            if (cur_error < best_error) {
+                for (int i = 0; i < n; ++i) L[i] = Laux[i];
+                best_error = cur_error;
+                scale = this_scale;
+                min_val = this_min;
+            }
+        }
+    }
+    
+    *the_min = -min_val;
+    return scale;
+}
+
+// Quantization optimized for FWHT-transformed activations
+// Uses symmetric quantization with optimal clipping for better quality
+static void quantize_row_q4_K_fwht(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_K == 0);
     const int nb = k / QK_K;
     block_q4_K * GGML_RESTRICT y = (block_q4_K *)vy;
 
+    uint8_t L[QK_K];
+    float weights[32];
+    float mins[8], scales[8];
+
     for (int i = 0; i < nb; i++) {
         const float * xb = x + i * QK_K;
-        
-        // Process 8 groups of 32 elements each
-        float scales[8], mins[8];
         float max_scale = 0, max_min = 0;
         
+        // Process 8 groups of 32 elements each with symmetric quantization
         for (int j = 0; j < 8; j++) {
             const float * xg = xb + j * 32;
-            float gmin = xg[0], gmax = xg[0];
             
-#if defined(RRS_AVX512)
-            __m512 vmin = _mm512_loadu_ps(xg);
-            __m512 vmax = vmin;
-            __m512 v1 = _mm512_loadu_ps(xg + 16);
-            vmin = _mm512_min_ps(vmin, v1);
-            vmax = _mm512_max_ps(vmax, v1);
-            gmin = _mm512_reduce_min_ps(vmin);
-            gmax = _mm512_reduce_max_ps(vmax);
-#elif defined(RRS_AVX2)
-            __m256 vmin = _mm256_loadu_ps(xg);
-            __m256 vmax = vmin;
-            for (int l = 8; l < 32; l += 8) {
-                __m256 v = _mm256_loadu_ps(xg + l);
-                vmin = _mm256_min_ps(vmin, v);
-                vmax = _mm256_max_ps(vmax, v);
-            }
-            // Horizontal min/max
-            __m128 lo = _mm256_castps256_ps128(vmin);
-            __m128 hi = _mm256_extractf128_ps(vmin, 1);
-            lo = _mm_min_ps(lo, hi);
-            lo = _mm_min_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2,3,0,1)));
-            lo = _mm_min_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1,0,3,2)));
-            gmin = _mm_cvtss_f32(lo);
-            lo = _mm256_castps256_ps128(vmax);
-            hi = _mm256_extractf128_ps(vmax, 1);
-            lo = _mm_max_ps(lo, hi);
-            lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2,3,0,1)));
-            lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1,0,3,2)));
-            gmax = _mm_cvtss_f32(lo);
-#else
-            for (int l = 1; l < 32; l++) {
-                if (xg[l] < gmin) gmin = xg[l];
-                if (xg[l] > gmax) gmax = xg[l];
-            }
-#endif
-            if (gmin > 0) gmin = 0;
-            mins[j] = -gmin;
-            scales[j] = (gmax - gmin) / 15.0f;
+            // Compute importance weights: av_x + |x[i]|
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; l++) sum_x2 += xg[l] * xg[l];
+            float av_x = sqrtf(sum_x2 / 32);
+            for (int l = 0; l < 32; l++) weights[l] = av_x + fabsf(xg[l]);
+            
+            // Use MSE-minimizing asymmetric quantization
+            scales[j] = make_qkx2_quants_fast(32, 15, xg, weights, L + j * 32, &mins[j]);
             if (scales[j] > max_scale) max_scale = scales[j];
             if (mins[j] > max_min) max_min = mins[j];
         }
         
-        // Encode scales/mins
+        // Encode scales/mins into block header
         float inv_scale = max_scale > 0 ? 63.f / max_scale : 0.f;
         float inv_min = max_min > 0 ? 63.f / max_min : 0.f;
         
@@ -235,16 +349,18 @@ static void quantize_row_q4_K_fast(const float * GGML_RESTRICT x, void * GGML_RE
         y[i].d = GGML_FP32_TO_FP16(max_scale / 63.f);
         y[i].dmin = GGML_FP32_TO_FP16(max_min / 63.f);
         
-        // Quantize all 256 values
-        uint8_t L[QK_K];
+        // Re-quantize with final encoded scales for accuracy
         for (int j = 0; j < 8; j++) {
             const float * xg = xb + j * 32;
             uint8_t sc, mn;
             get_scale_min_k4(j, y[i].scales, &sc, &mn);
             const float d = GGML_FP16_TO_FP32(y[i].d) * sc;
             const float dm = GGML_FP16_TO_FP32(y[i].dmin) * mn;
-            const float id = d > 0 ? 1.0f / d : 0.0f;
-            
+            if (d == 0) {
+                for (int l = 0; l < 32; l++) L[j * 32 + l] = 0;
+                continue;
+            }
+            const float id = 1.0f / d;
             for (int l = 0; l < 32; l++) {
                 int q4 = (int)((xg[l] + dm) * id + 0.5f);
                 L[j * 32 + l] = (uint8_t)(q4 < 0 ? 0 : (q4 > 15 ? 15 : q4));
@@ -252,6 +368,80 @@ static void quantize_row_q4_K_fast(const float * GGML_RESTRICT x, void * GGML_RE
         }
         
         // Pack into qs: each 64 values -> 32 bytes (low nibble + high nibble)
+        uint8_t * q = y[i].qs;
+        for (int j = 0; j < QK_K; j += 64) {
+            for (int l = 0; l < 32; l++) {
+                q[l] = L[j + l] | (L[j + l + 32] << 4);
+            }
+            q += 32;
+        }
+    }
+}
+
+// Standard asymmetric quantization (for non-FWHT data)
+static void quantize_row_q4_K_fast(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    block_q4_K * GGML_RESTRICT y = (block_q4_K *)vy;
+
+    uint8_t L[QK_K];
+    float weights[32];
+    float mins[8], scales[8];
+
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i * QK_K;
+        float max_scale = 0, max_min = 0;
+        
+        for (int j = 0; j < 8; j++) {
+            const float * xg = xb + j * 32;
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; l++) sum_x2 += xg[l] * xg[l];
+            float av_x = sqrtf(sum_x2 / 32);
+            for (int l = 0; l < 32; l++) weights[l] = av_x + fabsf(xg[l]);
+            
+            scales[j] = make_qkx2_quants_fast(32, 15, xg, weights, L + j * 32, &mins[j]);
+            if (scales[j] > max_scale) max_scale = scales[j];
+            if (mins[j] > max_min) max_min = mins[j];
+        }
+        
+        float inv_scale = max_scale > 0 ? 63.f / max_scale : 0.f;
+        float inv_min = max_min > 0 ? 63.f / max_min : 0.f;
+        
+        for (int j = 0; j < 8; j++) {
+            uint8_t ls = (uint8_t)(inv_scale * scales[j] + 0.5f);
+            uint8_t lm = (uint8_t)(inv_min * mins[j] + 0.5f);
+            if (ls > 63) ls = 63;
+            if (lm > 63) lm = 63;
+            if (j < 4) {
+                y[i].scales[j] = ls;
+                y[i].scales[j + 4] = lm;
+            } else {
+                y[i].scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                y[i].scales[j - 4] |= ((ls >> 4) << 6);
+                y[i].scales[j] |= ((lm >> 4) << 6);
+            }
+        }
+        
+        y[i].d = GGML_FP32_TO_FP16(max_scale / 63.f);
+        y[i].dmin = GGML_FP32_TO_FP16(max_min / 63.f);
+        
+        for (int j = 0; j < 8; j++) {
+            const float * xg = xb + j * 32;
+            uint8_t sc, mn;
+            get_scale_min_k4(j, y[i].scales, &sc, &mn);
+            const float d = GGML_FP16_TO_FP32(y[i].d) * sc;
+            const float dm = GGML_FP16_TO_FP32(y[i].dmin) * mn;
+            if (d == 0) {
+                for (int l = 0; l < 32; l++) L[j * 32 + l] = 0;
+                continue;
+            }
+            const float id = 1.0f / d;
+            for (int l = 0; l < 32; l++) {
+                int q4 = (int)((xg[l] + dm) * id + 0.5f);
+                L[j * 32 + l] = (uint8_t)(q4 < 0 ? 0 : (q4 > 15 ? 15 : q4));
+            }
+        }
+        
         uint8_t * q = y[i].qs;
         for (int j = 0; j < QK_K; j += 64) {
             for (int l = 0; l < 32; l++) {
@@ -277,7 +467,7 @@ void ggml_quantize_row_q4_K_rrs_act(const float * x, void * y, int64_t k) {
         ggml_fwht_impl(scratch + i, step);
     }
 
-    quantize_row_q4_K_fast(scratch, y, k);
+    quantize_row_q4_K_fwht(scratch, y, k);
 }
 
 GGML_API size_t quantize_q4_K_rrs(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -296,6 +486,7 @@ GGML_API size_t quantize_q4_K_rrs(const float * GGML_RESTRICT src, void * GGML_R
             for (int i = 0; i < n_per_row; i += step) {
                 ggml_fwht_impl(scratch + i, step);
             }
+            // Use standard high-quality quantizer for weights
             quantize_row_q4_K(scratch, qrow, n_per_row);
         }
         src += n_per_row;

@@ -1,8 +1,33 @@
 #include "rrs.cuh"
 #include "common.cuh"
 #include "vecdotq.cuh"
+#include "tcq4_k32.cuh"
+
+// For test functions - CPU quantize/dequantize
+extern "C" {
+#include "ggml-quants.h"
+void ggml_fwht_impl(float * data, int n);
+size_t quantize_q4_K_rrs(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights);
+}
+
+// Inline q8_1 dequant for test (avoid link issues)
+static void dequantize_row_q8_1_inline(const block_q8_1 * x, float * y, int64_t k) {
+    const int nb = k / QK8_1;
+    for (int i = 0; i < nb; i++) {
+        // Access d via raw pointer - use __half2float for CUDA
+        const half* d_ptr = (const half*)&x[i];
+        const float d = __half2float(*d_ptr);
+        for (int j = 0; j < QK8_1; j++) {
+            y[i * QK8_1 + j] = d * (float)x[i].qs[j];
+        }
+    }
+}
 
 #include <cuda_runtime.h>
+
+// Enable TCQ4-K32 path (experimental - set to 1 to enable)
+// NOTE: Requires pre-converted TCQ4_K32 model file, not runtime conversion
+#define USE_TCQ4_K32 0
 #include <cuda_pipeline.h>
 #include <mma.h>
 #include <cstdio>
@@ -109,6 +134,48 @@ __global__ void fwht_kernel_chunked(const float* __restrict__ x, float* __restri
         __syncthreads();
     }
 }
+
+// FWHT with fixed step=256 for TCQ4_K32 (embedding inverse transform)
+// TCQ4_K32 is quantized with 256-element FWHT chunks, so inverse must match
+__global__ void fwht_kernel_step256(const float* __restrict__ x, float* __restrict__ y, int n, int batch_size) {
+    extern __shared__ float smem_256[];
+    const int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    const float* x_row = x + batch_idx * n;
+    float* y_row = y + batch_idx * n;
+    const int step = 256;  // Fixed step for TCQ4_K32
+    const int num_chunks = n / step;
+    const float scale = rsqrtf((float)step);
+    for (int chunk = 0; chunk < num_chunks; chunk++) {
+        const int base = chunk * step;
+        for (int i = threadIdx.x; i < step; i += blockDim.x) smem_256[i] = x_row[base + i];
+        __syncthreads();
+        for (int h = 1; h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = threadIdx.x; i < step / 2; i += blockDim.x) {
+                const int block = i / h;
+                const int offset = i % h;
+                const int idx1 = block * stride + offset;
+                const int idx2 = idx1 + h;
+                fwht_butterfly(smem_256[idx1], smem_256[idx2]);
+            }
+            __syncthreads();
+        }
+        for (int i = threadIdx.x; i < step; i += blockDim.x) y_row[base + i] = smem_256[i] * scale;
+        __syncthreads();
+    }
+}
+
+// TCQ4-specific FWHT with fixed step=256 (for embedding inverse transform)
+void ggml_cuda_tcq4_fwht_step256(const float* x, float* y, int n, int batch_size, cudaStream_t stream) {
+    if (n % 256 != 0) {
+        fprintf(stderr, "[TCQ4 FWHT] Error: Dimension N=%d not a multiple of 256\n", n);
+        return;
+    }
+    const size_t smem_size = 256 * sizeof(float);
+    fwht_kernel_step256<<<batch_size, 128, smem_size, stream>>>(x, y, n, batch_size);
+}
+
 
 void ggml_cuda_rrs_fwht(const float* x, float* y, int n, int batch_size, cudaStream_t stream) {
     const int threads = min(256, (n + 1) / 2);
@@ -1827,7 +1894,165 @@ __global__ void rrs_gemm_q4k_q4k_batched_kernel(
 // This is much faster than Q4×Q4 because it reuses optimized MMVQ kernels
 // ============================================================================
 
+// Fused FWHT + Q8_1 quantization kernel for M=1 path
+// Eliminates intermediate fp32 buffer and separate kernel launches
+__global__ void rrs_fwht_quantize_q8_1_fused_kernel(
+    const float* __restrict__ src,
+    block_q8_1* __restrict__ dst,
+    const int K
+) {
+    extern __shared__ float smem_fused[];
+    
+    // Load from source
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        smem_fused[i] = src[i];
+    }
+    __syncthreads();
+    
+    // FWHT transform
+    const int step = K & -K;
+    const float scale = rsqrtf((float)step);
+    
+    for (int chunk_base = 0; chunk_base < K; chunk_base += step) {
+        for (int h = 1; h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = threadIdx.x; i < step / 2; i += blockDim.x) {
+                const int block_idx = i / h;
+                const int offset = i % h;
+                const int idx1 = chunk_base + block_idx * stride + offset;
+                const int idx2 = idx1 + h;
+                float a = smem_fused[idx1];
+                float b = smem_fused[idx2];
+                smem_fused[idx1] = a + b;
+                smem_fused[idx2] = a - b;
+            }
+            __syncthreads();
+        }
+        for (int i = threadIdx.x; i < step; i += blockDim.x) {
+            smem_fused[chunk_base + i] *= scale;
+        }
+        __syncthreads();
+    }
+    
+    // Quantize to Q8_1 - each block of 32 elements
+    const int num_q8_blocks = K / QK8_1;
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp_id = tid / 32;
+    const int num_warps = blockDim.x / 32;
+    
+    for (int b = warp_id; b < num_q8_blocks; b += num_warps) {
+        float* block_data = smem_fused + b * QK8_1;
+        
+        // Find absmax using warp reduction
+        float amax = 0.0f;
+        float val = block_data[lane];
+        amax = fabsf(val);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask));
+        }
+        
+        // Compute scale
+        const float d = amax / 127.0f;
+        const float id = (d > 0.0f) ? (127.0f / amax) : 0.0f;
+        
+        // Quantize
+        int8_t q = (int8_t)roundf(val * id);
+        
+        // Write to output
+        block_q8_1* out_block = dst + b;
+        out_block->qs[lane] = q;
+        
+        // First lane writes scale and sum using ds union
+        if (lane == 0) {
+            // Compute sum for Q8_1 format
+            float sum = 0.0f;
+            for (int i = 0; i < QK8_1; i++) {
+                sum += block_data[i];
+            }
+            // ds.x = d (delta), ds.y = d * sum
+            out_block->ds = make_half2(__float2half(d), __float2half(sum * d));
+        }
+    }
+}
+
 // FWHT kernel that transforms fp32 activations in-place
+// Optimized FWHT kernel that reads from src and writes to dst (no separate D2D copy needed)
+// Uses warp-level shuffle for small h values to reduce __syncthreads() overhead
+__global__ void rrs_fwht_kernel_opt(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const int K,
+    const int M
+) {
+    extern __shared__ float smem_fwht_opt[];
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    
+    const float* src_row = src + row * K;
+    float* dst_row = dst + row * K;
+    
+    // Load from source directly into shared memory
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        smem_fwht_opt[i] = src_row[i];
+    }
+    __syncthreads();
+    
+    const int step = K & -K;
+    const float scale = rsqrtf((float)step);
+    
+    for (int chunk_base = 0; chunk_base < K; chunk_base += step) {
+        // For small h (within warp), use warp shuffles to reduce syncs
+        // For h >= 32, we need __syncthreads()
+        
+        // Process h=1 to h=16 using warp-level operations (no sync needed within warp)
+        // Each thread handles pairs at increasing distances
+        for (int h = 1; h < 32 && h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = threadIdx.x; i < step / 2; i += blockDim.x) {
+                const int block_idx = i / h;
+                const int offset = i % h;
+                const int idx1 = chunk_base + block_idx * stride + offset;
+                const int idx2 = idx1 + h;
+                float a = smem_fwht_opt[idx1];
+                float b = smem_fwht_opt[idx2];
+                smem_fwht_opt[idx1] = a + b;
+                smem_fwht_opt[idx2] = a - b;
+            }
+            __syncthreads();
+        }
+        
+        // Process remaining stages (h >= 32)
+        for (int h = 32; h < step; h <<= 1) {
+            const int stride = h << 1;
+            for (int i = threadIdx.x; i < step / 2; i += blockDim.x) {
+                const int block_idx = i / h;
+                const int offset = i % h;
+                const int idx1 = chunk_base + block_idx * stride + offset;
+                const int idx2 = idx1 + h;
+                float a = smem_fwht_opt[idx1];
+                float b = smem_fwht_opt[idx2];
+                smem_fwht_opt[idx1] = a + b;
+                smem_fwht_opt[idx2] = a - b;
+            }
+            __syncthreads();
+        }
+        
+        // Apply scale (fused with last stage to reduce memory traffic)
+        for (int i = threadIdx.x; i < step; i += blockDim.x) {
+            smem_fwht_opt[chunk_base + i] *= scale;
+        }
+        __syncthreads();
+    }
+    
+    // Write to destination
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        dst_row[i] = smem_fwht_opt[i];
+    }
+}
+
+// Legacy inplace kernel for compatibility
 __global__ void rrs_fwht_inplace_kernel(float* __restrict__ data, const int K, const int M) {
     extern __shared__ float smem_fwht_ip[];
     const int row = blockIdx.x;
@@ -2045,21 +2270,158 @@ __global__ void rrs_mmvq_m1_kernel(
     }
 }
 
+// Set to 1 to use Runtime Smooth W4A4 (paper's approach), 0 for W4A8 fallback
+#define TCQ4_USE_RRS_W4A4 1
+// Set to 1 to use tensor core accelerated kernels (IMMA), 0 for scalar fallback
+#define TCQ4_USE_TENSOR_CORES 1
+
 void ggml_cuda_rrs_mul_mat(ggml_backend_cuda_context& ctx, const ggml_tensor* src0, const ggml_tensor* src1, ggml_tensor* dst) {
     const int M = src1->ne[1], N = src0->ne[1], K = src0->ne[0];
     cudaStream_t stream = ctx.stream();
     
+    // TCQ4_K32 type: True W4A4 with Runtime Smooth (from RRS paper)
+    // Key insight: divide by group-max BEFORE quantization, multiply AFTER dot product
+    if (src0->type == GGML_TYPE_TCQ4_K32) {
+        static int tcq4_call_count = 0;
+        if (tcq4_call_count < 3) {
+#if TCQ4_USE_RRS_W4A4
+            fprintf(stderr, "[TCQ4-RRS-W4A4] mul_mat M=%d N=%d K=%d\n", M, N, K);
+#else
+            fprintf(stderr, "[TCQ4-W4A8] mul_mat M=%d N=%d K=%d\n", M, N, K);
+#endif
+            tcq4_call_count++;
+        }
+        
+#if TCQ4_USE_RRS_W4A4
+        // Runtime Smooth W4A4 path (paper's approach)
+        // 1. FWHT to spread spike outliers
+        // 2. Runtime Smooth: divide by group-max, store scale separately
+        // 3. Quantize normalized values to INT4
+        // 4. Dot product with TCQ4 weights (using tensor cores if enabled)
+        // 5. Multiply by smooth scale to restore magnitude
+        const int num_k_blocks = K / TCQ4_K32_BLOCK_SIZE;
+        
+#if TCQ4_USE_TENSOR_CORES
+        // Tensor core path: uses block_rrs_int4_tc with precomputed group sums
+        // block_rrs_int4_tc: 128 bytes INT4 + 4 bytes smooth_scale + 16 bytes sum_q = 148 bytes
+        size_t rrs_size = M * num_k_blocks * sizeof(block_rrs_int4_tc);
+        size_t rrs_actual;
+        void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
+        
+        // Fused FWHT + Runtime Smooth + INT4 quantize (with group sums for tensor cores)
+        tcq4_rrs_fwht_quantize_tc((const float*)src1->data, d_act_rrs, K, M, stream);
+        
+        // Dispatch GEMM/GEMV with tensor cores
+        if (M == 1) {
+            tcq4_rrs_gemv_tc(d_act_rrs, src0->data, (float*)dst->data, N, K, stream);
+        } else {
+            tcq4_rrs_gemm_imma(d_act_rrs, src0->data, (float*)dst->data, M, N, K, stream);
+        }
+#else
+        // Scalar fallback path: uses block_rrs_int4 (simpler, no group sums)
+        // block_rrs_int4: 128 bytes INT4 + 4 bytes smooth_scale = 132 bytes per 256 elements
+        size_t rrs_size = M * num_k_blocks * sizeof(block_rrs_int4);
+        size_t rrs_actual;
+        void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
+        
+        // Fused FWHT + Runtime Smooth + INT4 quantize
+        tcq4_rrs_fwht_quantize((const float*)src1->data, d_act_rrs, K, M, stream);
+        
+        // Dispatch GEMM/GEMV with scalar kernels
+        if (M == 1) {
+            tcq4_rrs_gemv(d_act_rrs, src0->data, (float*)dst->data, N, K, stream);
+        } else {
+            tcq4_rrs_gemm(d_act_rrs, src0->data, (float*)dst->data, M, N, K, stream);
+        }
+#endif
+#else
+        // W4A8 fallback: TCQ4 weights + Q8_1 activations (more accurate but not true W4A4)
+        const int num_q8_blocks = K / QK8_1;
+        size_t q8_size = M * num_q8_blocks * sizeof(block_q8_1);
+        size_t q8_actual;
+        void* d_q8 = ctx.pool().alloc(q8_size, &q8_actual);
+        
+        // FWHT + quantize to Q8_1
+        tcq4_fwht_quantize_q8((const float*)src1->data, d_q8, K, M, stream);
+        
+        if (M == 1) {
+            tcq4_k32_q8_gemv(d_q8, src0->data, (float*)dst->data, N, K, stream);
+        } else {
+            // Row-by-row GEMV for M > 1
+            for (int m = 0; m < M; m++) {
+                tcq4_k32_q8_gemv(
+                    (const char*)d_q8 + m * num_q8_blocks * sizeof(block_q8_1),
+                    src0->data,
+                    (float*)dst->data + m * N,
+                    N, K, stream);
+            }
+        }
+#endif
+        return;
+    }
+    
+    // For M=1, use fused kernel that combines FWHT + Quantize + GEMM in one launch
+    // This eliminates kernel launch overhead and memory traffic
+    // DISABLED: Performance regression - Q4K dot product slower than Q4K x Q8_1
+    if (false && M == 1 && (K == 1024 || K == 2048 || K == 3072 || K == 4096)) {
+        // Fused kernel: each block computes M1_COLS_PER_BLOCK output columns
+        const int num_k_blocks = K / 256;
+        // Shared memory: K floats for FWHT + num_k_blocks Q4_K blocks for quantized data
+        size_t smem_size = K * sizeof(float) + num_k_blocks * sizeof(block_q4_K);
+        
+        dim3 grid((N + M1_COLS_PER_BLOCK - 1) / M1_COLS_PER_BLOCK);
+        dim3 block(256);
+        
+        switch (K) {
+            case 1024:
+                rrs_fused_m1_kernel<1024><<<grid, block, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 2048:
+                rrs_fused_m1_kernel<2048><<<grid, block, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 3072:
+                rrs_fused_m1_kernel<3072><<<grid, block, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+            case 4096:
+                rrs_fused_m1_kernel<4096><<<grid, block, smem_size, stream>>>(
+                    (const float*)src1->data, src0->data, (float*)dst->data, N);
+                break;
+        }
+        return;
+    }
+    
+    // Fallback path for other cases
+    const int num_q8_blocks = K / QK8_1;
+    
+    // For M=1, use fused FWHT + Q8_1 kernel (single kernel launch)
+    if (M == 1) {
+        size_t q8_size = num_q8_blocks * sizeof(block_q8_1);
+        size_t q8_actual;
+        void* d_q8 = ctx.pool().alloc(q8_size, &q8_actual);
+        
+        // Fused FWHT + quantize in one kernel
+        rrs_fwht_quantize_q8_1_fused_kernel<<<1, 256, K * sizeof(float), stream>>>(
+            (const float*)src1->data, (block_q8_1*)d_q8, K);
+        
+        // Matrix multiply
+        rrs_mmvq_m1_kernel<<<N, 256, 0, stream>>>(src0->data, d_q8, (float*)dst->data, N, K);
+        return;
+    }
+    
+    // For M>1, use separate kernels
     // Allocate temporary buffer for FWHT'd activations (fp32)
     size_t fwht_size = M * K * sizeof(float);
     size_t fwht_actual;
     float* d_fwht = (float*)ctx.pool().alloc(fwht_size, &fwht_actual);
     
-    // Copy activations and apply FWHT in-place
-    cudaMemcpyAsync(d_fwht, src1->data, fwht_size, cudaMemcpyDeviceToDevice, stream);
-    rrs_fwht_inplace_kernel<<<M, 256, K * sizeof(float), stream>>>(d_fwht, K, M);
+    // Apply FWHT directly from source to destination (eliminates separate D2D copy)
+    rrs_fwht_kernel_opt<<<M, 256, K * sizeof(float), stream>>>(
+        (const float*)src1->data, d_fwht, K, M);
     
     // Allocate Q8_1 buffer for quantized activations
-    const int num_q8_blocks = K / QK8_1;
     size_t q8_size = M * num_q8_blocks * sizeof(block_q8_1);
     size_t q8_actual;
     void* d_q8 = ctx.pool().alloc(q8_size, &q8_actual);
@@ -2069,9 +2431,7 @@ void ggml_cuda_rrs_mul_mat(ggml_backend_cuda_context& ctx, const ggml_tensor* sr
     rrs_quantize_q8_1_kernel<<<quant_grid, 32, 0, stream>>>(d_fwht, (block_q8_1*)d_q8, K, M);
     
     // Use MMVQ kernel for matrix multiply
-    if (M == 1) {
-        rrs_mmvq_m1_kernel<<<N, 256, 0, stream>>>(src0->data, d_q8, (float*)dst->data, N, K);
-    } else if (M <= 8) {
+    if (M <= 8) {
         dim3 grid(N, (M + 7) / 8);
         rrs_mmvq_kernel<8><<<grid, 256, 0, stream>>>(src0->data, d_q8, (float*)dst->data, N, K, M);
     } else {
@@ -2107,7 +2467,7 @@ void ggml_cuda_rrs_mul_mat(ggml_backend_cuda_context& ctx, const ggml_tensor* sr
 }
 
 bool ggml_cuda_supports_rrs(const ggml_tensor* tensor) {
-    if (tensor->type != GGML_TYPE_Q4_K_RRS) return false;
+    if (tensor->type != GGML_TYPE_Q4_K_RRS && tensor->type != GGML_TYPE_TCQ4_K32) return false;
     int dev; cudaGetDevice(&dev); cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
     return (prop.major > 7) || (prop.major == 7 && prop.minor >= 5);
 }
@@ -2159,4 +2519,970 @@ extern "C" void ggml_cuda_rrs_test(void) {
     int dev; cudaGetDevice(&dev); cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
     printf("RRS CUDA Test on: %s (SM%d%d)\n", prop.name, prop.major, prop.minor);
     RRSBenchmarkResult res; ggml_cuda_rrs_benchmark(128, 2048, 2048, 50, &res); ggml_cuda_rrs_print_benchmark(&res);
+}
+
+// TCQ4-K32 test function with correctness validation
+extern "C" void ggml_cuda_tcq4_test(void) {
+    int dev; cudaGetDevice(&dev); cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
+    printf("\n=== TCQ4-K32 Test on: %s (SM%d%d) ===\n", prop.name, prop.major, prop.minor);
+    
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    
+    // Test 1: Validate Q4_K -> TCQ4_K32 -> dequant roundtrip
+    printf("\n[1] Testing Q4_K -> TCQ4_K32 conversion correctness...\n");
+    {
+        const int K = 2048;
+        const int num_blocks = K / 256;
+        
+        // Allocate test data
+        float *h_fp32, *h_dequant;
+        block_q4_K *h_q4k;
+        h_fp32 = (float*)malloc(K * sizeof(float));
+        h_dequant = (float*)malloc(K * sizeof(float));
+        h_q4k = (block_q4_K*)malloc(num_blocks * sizeof(block_q4_K));
+        
+        // Initialize with known pattern
+        for (int i = 0; i < K; i++) {
+            h_fp32[i] = sinf((float)i * 0.1f) * 2.0f;
+        }
+        
+        // Quantize to Q4_K on CPU
+        quantize_row_q4_K_ref(h_fp32, h_q4k, K);
+        
+        // Upload to GPU
+        block_q4_K *d_q4k;
+        block_tcq4_k32 *d_tcq4;
+        float *d_dequant;
+        cudaMalloc(&d_q4k, num_blocks * sizeof(block_q4_K));
+        cudaMalloc(&d_tcq4, num_blocks * sizeof(block_tcq4_k32));
+        cudaMalloc(&d_dequant, K * sizeof(float));
+        cudaMemcpy(d_q4k, h_q4k, num_blocks * sizeof(block_q4_K), cudaMemcpyHostToDevice);
+        
+        // Convert Q4_K -> TCQ4_K32
+        tcq4_k32_convert_from_q4k(d_q4k, d_tcq4, num_blocks, stream);
+        cudaStreamSynchronize(stream);
+        
+        // Dequantize TCQ4_K32 back to FP32 on CPU
+        block_tcq4_k32 *h_tcq4 = (block_tcq4_k32*)malloc(num_blocks * sizeof(block_tcq4_k32));
+        cudaMemcpy(h_tcq4, d_tcq4, num_blocks * sizeof(block_tcq4_k32), cudaMemcpyDeviceToHost);
+        dequantize_row_tcq4_k32(h_tcq4, h_dequant, K);
+        
+        // Compute error vs original Q4_K dequant
+        float *h_q4k_dequant = (float*)malloc(K * sizeof(float));
+        dequantize_row_q4_K(h_q4k, h_q4k_dequant, K);
+        
+        float max_err = 0.0f, sum_err = 0.0f;
+        for (int i = 0; i < K; i++) {
+            float err = fabsf(h_dequant[i] - h_q4k_dequant[i]);
+            max_err = fmaxf(max_err, err);
+            sum_err += err;
+        }
+        printf("    Q4_K vs TCQ4_K32 dequant: max_err=%.6f, avg_err=%.6f\n", max_err, sum_err / K);
+        printf("    Conversion: %s\n", (max_err < 0.5f) ? "PASSED" : "FAILED");
+        
+        cudaFree(d_q4k); cudaFree(d_tcq4); cudaFree(d_dequant);
+        free(h_fp32); free(h_dequant); free(h_q4k); free(h_tcq4); free(h_q4k_dequant);
+    }
+    
+    // Test 1b: Compare TCQ4_K32 vs Q4_K_RRS quantization (both with FWHT)
+    printf("\n[1b] Comparing TCQ4_K32 vs Q4_K_RRS quantization (with FWHT)...\n");
+    {
+        const int K = 1024;
+        
+        // Create test data
+        float *h_fp32 = (float*)malloc(K * sizeof(float));
+        for (int i = 0; i < K; i++) h_fp32[i] = sinf((float)i * 0.1f) * 2.0f;
+        
+        // Quantize with Q4_K_RRS (uses Q4_K format + FWHT)
+        size_t q4k_rrs_size = ggml_row_size(GGML_TYPE_Q4_K_RRS, K);
+        void *h_q4k_rrs = malloc(q4k_rrs_size);
+        quantize_q4_K_rrs(h_fp32, h_q4k_rrs, 1, K, NULL);
+        
+        // Quantize with TCQ4_K32 (uses TCQ4 format + FWHT)
+        size_t tcq4_size = ggml_row_size(GGML_TYPE_TCQ4_K32, K);
+        void *h_tcq4 = malloc(tcq4_size);
+        quantize_tcq4_k32(h_fp32, h_tcq4, 1, K, NULL);
+        
+        // Dequantize both
+        float *h_dequant_q4k = (float*)malloc(K * sizeof(float));
+        float *h_dequant_tcq4 = (float*)malloc(K * sizeof(float));
+        dequantize_row_q4_K((const block_q4_K*)h_q4k_rrs, h_dequant_q4k, K);
+        dequantize_row_tcq4_k32((const block_tcq4_k32*)h_tcq4, h_dequant_tcq4, K);
+        
+        // Compare dequantized values
+        float max_diff = 0.0f, sum_diff = 0.0f;
+        for (int i = 0; i < K; i++) {
+            float diff = fabsf(h_dequant_q4k[i] - h_dequant_tcq4[i]);
+            max_diff = fmaxf(max_diff, diff);
+            sum_diff += diff;
+        }
+        printf("    Q4_K_RRS vs TCQ4_K32 dequant: max_diff=%.6f, avg_diff=%.6f\n", max_diff, sum_diff / K);
+        
+        // Also check error vs original (both should FWHT then quant)
+        float *h_fwht = (float*)malloc(K * sizeof(float));
+        memcpy(h_fwht, h_fp32, K * sizeof(float));
+        for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_fwht + i, 256);
+        
+        float max_err_q4k = 0.0f, max_err_tcq4 = 0.0f;
+        for (int i = 0; i < K; i++) {
+            max_err_q4k = fmaxf(max_err_q4k, fabsf(h_dequant_q4k[i] - h_fwht[i]));
+            max_err_tcq4 = fmaxf(max_err_tcq4, fabsf(h_dequant_tcq4[i] - h_fwht[i]));
+        }
+        printf("    Q4_K_RRS vs FWHT(orig): max_err=%.6f\n", max_err_q4k);
+        printf("    TCQ4_K32 vs FWHT(orig): max_err=%.6f\n", max_err_tcq4);
+        printf("    First 8 FWHT(orig): [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_fwht[0], h_fwht[1], h_fwht[2], h_fwht[3], h_fwht[4], h_fwht[5], h_fwht[6], h_fwht[7]);
+        printf("    First 8 Q4K dequant: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_dequant_q4k[0], h_dequant_q4k[1], h_dequant_q4k[2], h_dequant_q4k[3],
+               h_dequant_q4k[4], h_dequant_q4k[5], h_dequant_q4k[6], h_dequant_q4k[7]);
+        printf("    First 8 TCQ4 dequant: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_dequant_tcq4[0], h_dequant_tcq4[1], h_dequant_tcq4[2], h_dequant_tcq4[3],
+               h_dequant_tcq4[4], h_dequant_tcq4[5], h_dequant_tcq4[6], h_dequant_tcq4[7]);
+        
+        free(h_fp32); free(h_q4k_rrs); free(h_tcq4);
+        free(h_dequant_q4k); free(h_dequant_tcq4); free(h_fwht);
+    }
+    
+    // Test 2: Validate GEMV correctness (no FWHT - just TCQ4 dot product)
+    printf("\n[2] Testing GEMV (M=1) correctness (no FWHT)...\n");
+    {
+        const int N = 64, K = 256;
+        const int num_k_blocks = K / 256;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(N * sizeof(float));
+        float *h_out_tcq4 = (float*)malloc(N * sizeof(float));
+        
+        for (int i = 0; i < K; i++) h_act[i] = (float)(i % 10) * 0.1f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = (float)(i % 7) * 0.05f - 0.15f;
+        
+        // Reference: FP32 matmul
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+            h_out_ref[n] = sum;
+        }
+        
+        // Quantize to TCQ4_K32 (no FWHT)
+        block_tcq4_k32 *h_act_tcq4 = (block_tcq4_k32*)malloc(num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        quantize_row_tcq4_k32_ref(h_act, h_act_tcq4, K);
+        for (int n = 0; n < N; n++) {
+            quantize_row_tcq4_k32_ref(h_wgt + n * K, h_wgt_tcq4 + n * num_k_blocks, K);
+        }
+        
+        block_tcq4_k32 *d_act, *d_wgt;
+        float *d_out;
+        cudaMalloc(&d_act, num_k_blocks * sizeof(block_tcq4_k32));
+        cudaMalloc(&d_wgt, N * num_k_blocks * sizeof(block_tcq4_k32));
+        cudaMalloc(&d_out, N * sizeof(float));
+        cudaMemcpy(d_act, h_act_tcq4, num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_wgt, h_wgt_tcq4, N * num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+        
+        tcq4_k32_gemv(d_act, d_wgt, d_out, N, K, stream);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_out_tcq4, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        float max_err = 0.0f, sum_err = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float err = fabsf(h_out_tcq4[n] - h_out_ref[n]);
+            float rel_err = err / (fabsf(h_out_ref[n]) + 1e-6f);
+            max_err = fmaxf(max_err, rel_err);
+            sum_err += rel_err;
+        }
+        printf("    GEMV rel error: max=%.4f, avg=%.4f\n", max_err, sum_err / N);
+        printf("    GEMV (no FWHT): %s\n", (max_err < 0.5f) ? "PASSED" : "FAILED");
+        
+        // Debug: print first few outputs
+        printf("    First 4 outputs: ref=[%.4f, %.4f, %.4f, %.4f] tcq4=[%.4f, %.4f, %.4f, %.4f]\n",
+               h_out_ref[0], h_out_ref[1], h_out_ref[2], h_out_ref[3],
+               h_out_tcq4[0], h_out_tcq4[1], h_out_tcq4[2], h_out_tcq4[3]);
+        
+        // Debug: compute reference using dequantized TCQ4 values
+        float *h_act_dequant = (float*)malloc(K * sizeof(float));
+        float *h_wgt_dequant = (float*)malloc(N * K * sizeof(float));
+        dequantize_row_tcq4_k32(h_act_tcq4, h_act_dequant, K);
+        for (int n = 0; n < N; n++) {
+            dequantize_row_tcq4_k32(h_wgt_tcq4 + n * num_k_blocks, h_wgt_dequant + n * K, K);
+        }
+        
+        float *h_out_dequant_ref = (float*)malloc(N * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act_dequant[k] * h_wgt_dequant[n * K + k];
+            h_out_dequant_ref[n] = sum;
+        }
+        printf("    Dequant ref: [%.4f, %.4f, %.4f, %.4f]\n", 
+               h_out_dequant_ref[0], h_out_dequant_ref[1], h_out_dequant_ref[2], h_out_dequant_ref[3]);
+        
+        // Check dequant ref vs CUDA result
+        float max_err_vs_dequant = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float err = fabsf(h_out_tcq4[n] - h_out_dequant_ref[n]);
+            max_err_vs_dequant = fmaxf(max_err_vs_dequant, err);
+        }
+        printf("    CUDA vs dequant-ref max error: %.6f\n", max_err_vs_dequant);
+        
+        // Debug: print TCQ4 block metadata
+        printf("    Act TCQ4[0]: S=%.6f, Z=%.6f, sc=[%d,%d,%d,%d], zc=[%d,%d,%d,%d]\n",
+               __half2float(h_act_tcq4[0].S), __half2float(h_act_tcq4[0].Z),
+               (int)h_act_tcq4[0].sc[0], (int)h_act_tcq4[0].sc[1], 
+               (int)h_act_tcq4[0].sc[2], (int)h_act_tcq4[0].sc[3],
+               (int)h_act_tcq4[0].zc[0], (int)h_act_tcq4[0].zc[1],
+               (int)h_act_tcq4[0].zc[2], (int)h_act_tcq4[0].zc[3]);
+        printf("    Wgt TCQ4[0]: S=%.6f, Z=%.6f, sc=[%d,%d,%d,%d]\n",
+               __half2float(h_wgt_tcq4[0].S), __half2float(h_wgt_tcq4[0].Z),
+               (int)h_wgt_tcq4[0].sc[0], (int)h_wgt_tcq4[0].sc[1],
+               (int)h_wgt_tcq4[0].sc[2], (int)h_wgt_tcq4[0].sc[3]);
+        
+        free(h_act_dequant); free(h_wgt_dequant); free(h_out_dequant_ref);
+        cudaFree(d_act); cudaFree(d_wgt); cudaFree(d_out);
+        free(h_act); free(h_wgt); free(h_out_ref); free(h_out_tcq4);
+        free(h_act_tcq4); free(h_wgt_tcq4);
+    }
+    
+    // Test 2a: GEMM (M>1) correctness
+    printf("\n[2a] Testing GEMM (M=4) correctness (no FWHT)...\n");
+    {
+        const int M = 4, N = 32, K = 256;
+        const int num_k_blocks = K / 256;
+        
+        float *h_act = (float*)malloc(M * K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(M * N * sizeof(float));
+        float *h_out_tcq4 = (float*)malloc(M * N * sizeof(float));
+        
+        for (int i = 0; i < M * K; i++) h_act[i] = sinf((float)i * 0.07f) * 0.4f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.05f) * 0.3f;
+        
+        // Reference: FP32 matmul
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) sum += h_act[m * K + k] * h_wgt[n * K + k];
+                h_out_ref[m * N + n] = sum;
+            }
+        }
+        
+        // Quantize to TCQ4_K32 (no FWHT)
+        block_tcq4_k32 *h_act_tcq4 = (block_tcq4_k32*)malloc(M * num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        for (int m = 0; m < M; m++) {
+            quantize_row_tcq4_k32_ref(h_act + m * K, h_act_tcq4 + m * num_k_blocks, K);
+        }
+        for (int n = 0; n < N; n++) {
+            quantize_row_tcq4_k32_ref(h_wgt + n * K, h_wgt_tcq4 + n * num_k_blocks, K);
+        }
+        
+        block_tcq4_k32 *d_act, *d_wgt;
+        float *d_out;
+        cudaMalloc(&d_act, M * num_k_blocks * sizeof(block_tcq4_k32));
+        cudaMalloc(&d_wgt, N * num_k_blocks * sizeof(block_tcq4_k32));
+        cudaMalloc(&d_out, M * N * sizeof(float));
+        cudaMemcpy(d_act, h_act_tcq4, M * num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_wgt, h_wgt_tcq4, N * num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+        
+        tcq4_k32_gemm_imma(d_act, d_wgt, d_out, M, N, K, stream);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_out_tcq4, d_out, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Compute reference using dequantized values
+        float *h_act_dequant = (float*)malloc(M * K * sizeof(float));
+        float *h_wgt_dequant = (float*)malloc(N * K * sizeof(float));
+        for (int m = 0; m < M; m++) dequantize_row_tcq4_k32(h_act_tcq4 + m * num_k_blocks, h_act_dequant + m * K, K);
+        for (int n = 0; n < N; n++) dequantize_row_tcq4_k32(h_wgt_tcq4 + n * num_k_blocks, h_wgt_dequant + n * K, K);
+        
+        float *h_out_dequant_ref = (float*)malloc(M * N * sizeof(float));
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) sum += h_act_dequant[m * K + k] * h_wgt_dequant[n * K + k];
+                h_out_dequant_ref[m * N + n] = sum;
+            }
+        }
+        
+        float max_err_vs_dequant = 0.0f, max_err_vs_fp32 = 0.0f;
+        for (int i = 0; i < M * N; i++) {
+            max_err_vs_dequant = fmaxf(max_err_vs_dequant, fabsf(h_out_tcq4[i] - h_out_dequant_ref[i]));
+            float rel_err = fabsf(h_out_tcq4[i] - h_out_ref[i]) / (fabsf(h_out_ref[i]) + 1e-6f);
+            max_err_vs_fp32 = fmaxf(max_err_vs_fp32, rel_err);
+        }
+        printf("    GEMM vs dequant-ref max error: %.6f\n", max_err_vs_dequant);
+        printf("    GEMM vs FP32 max rel error: %.4f\n", max_err_vs_fp32);
+        printf("    GEMM (M=4): %s\n", (max_err_vs_dequant < 0.001f) ? "PASSED" : "FAILED");
+        
+        printf("    First row: ref=[%.4f, %.4f, %.4f, %.4f] tcq4=[%.4f, %.4f, %.4f, %.4f]\n",
+               h_out_ref[0], h_out_ref[1], h_out_ref[2], h_out_ref[3],
+               h_out_tcq4[0], h_out_tcq4[1], h_out_tcq4[2], h_out_tcq4[3]);
+        
+        cudaFree(d_act); cudaFree(d_wgt); cudaFree(d_out);
+        free(h_act); free(h_wgt); free(h_out_ref); free(h_out_tcq4);
+        free(h_act_tcq4); free(h_wgt_tcq4);
+        free(h_act_dequant); free(h_wgt_dequant); free(h_out_dequant_ref);
+    }
+    
+    // Test 2b: Full FWHT path (simulates actual inference)
+    printf("\n[2b] Testing full FWHT path (simulates inference)...\n");
+    {
+        const int N = 64, K = 256;
+        const int num_k_blocks = K / 256;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(N * sizeof(float));
+        float *h_out_tcq4 = (float*)malloc(N * sizeof(float));
+        
+        // Initialize with varied data
+        for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.03f) * 0.3f;
+        
+        // Reference: FP32 matmul (original space)
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+            h_out_ref[n] = sum;
+        }
+        
+        // Simulate offline weight quantization: FWHT + TCQ4 quantize
+        float *h_wgt_fwht = (float*)malloc(N * K * sizeof(float));
+        block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwht + n * K, h_wgt + n * K, K * sizeof(float));
+            ggml_fwht_impl(h_wgt_fwht + n * K, K);  // FWHT weights
+            quantize_row_tcq4_k32_ref(h_wgt_fwht + n * K, h_wgt_tcq4 + n * num_k_blocks, K);
+        }
+        
+        // Upload weights to GPU
+        block_tcq4_k32 *d_wgt;
+        cudaMalloc(&d_wgt, N * num_k_blocks * sizeof(block_tcq4_k32));
+        cudaMemcpy(d_wgt, h_wgt_tcq4, N * num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+        
+        // Runtime: upload FP32 activations, use tcq4_k32_fwht_quantize (FWHT + quant on GPU)
+        float *d_act_fp32;
+        block_tcq4_k32 *d_act_tcq4;
+        float *d_out;
+        cudaMalloc(&d_act_fp32, K * sizeof(float));
+        cudaMalloc(&d_act_tcq4, num_k_blocks * sizeof(block_tcq4_k32));
+        cudaMalloc(&d_out, N * sizeof(float));
+        cudaMemcpy(d_act_fp32, h_act, K * sizeof(float), cudaMemcpyHostToDevice);
+        
+        // FWHT + quantize activations on GPU
+        tcq4_k32_fwht_quantize(d_act_fp32, d_act_tcq4, K, 1, stream);
+        cudaStreamSynchronize(stream);
+        
+        // Run GEMV
+        tcq4_k32_gemv(d_act_tcq4, d_wgt, d_out, N, K, stream);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_out_tcq4, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        float max_err = 0.0f, sum_err = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float err = fabsf(h_out_tcq4[n] - h_out_ref[n]);
+            float rel_err = err / (fabsf(h_out_ref[n]) + 1e-6f);
+            max_err = fmaxf(max_err, rel_err);
+            sum_err += rel_err;
+        }
+        printf("    Full path rel error: max=%.4f, avg=%.4f\n", max_err, sum_err / N);
+        printf("    Full FWHT path: %s\n", (max_err < 0.5f) ? "PASSED" : "FAILED");
+        
+        // Debug: print first few outputs
+        printf("    First 4 outputs: ref=[%.4f, %.4f, %.4f, %.4f] tcq4=[%.4f, %.4f, %.4f, %.4f]\n",
+               h_out_ref[0], h_out_ref[1], h_out_ref[2], h_out_ref[3],
+               h_out_tcq4[0], h_out_tcq4[1], h_out_tcq4[2], h_out_tcq4[3]);
+        
+        // Debug: check intermediate FWHT'd activation quantization
+        block_tcq4_k32 h_act_tcq4_debug;
+        cudaMemcpy(&h_act_tcq4_debug, d_act_tcq4, sizeof(block_tcq4_k32), cudaMemcpyDeviceToHost);
+        float S = __half2float(h_act_tcq4_debug.S);
+        float Z = __half2float(h_act_tcq4_debug.Z);
+        printf("    Act TCQ4 block 0: S=%.6f, Z=%.6f, sc[0]=%d, zc[0]=%d\n", 
+               S, Z, (int)h_act_tcq4_debug.sc[0], (int)h_act_tcq4_debug.zc[0]);
+        
+        cudaFree(d_act_fp32); cudaFree(d_act_tcq4); cudaFree(d_wgt); cudaFree(d_out);
+        free(h_act); free(h_wgt); free(h_wgt_fwht); free(h_out_ref); free(h_out_tcq4);
+        free(h_wgt_tcq4);
+    }
+    
+    // Test 2d: Verify TCQ4 FWHT+Q8 kernel produces correct results
+    printf("\n[2d] Testing TCQ4 FWHT+Q8 kernel correctness...\n");
+    {
+        const int K = 1024;
+        const int num_q8_blocks = K / QK8_1;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+        
+        // CPU reference: FWHT with step=256, then quantize to Q8_1
+        float *h_fwht_cpu = (float*)malloc(K * sizeof(float));
+        memcpy(h_fwht_cpu, h_act, K * sizeof(float));
+        for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_fwht_cpu + i, 256);
+        
+        // Upload to GPU and run tcq4_fwht_quantize_q8
+        float *d_act;
+        block_q8_1 *d_q8;
+        cudaMalloc(&d_act, K * sizeof(float));
+        cudaMalloc(&d_q8, num_q8_blocks * sizeof(block_q8_1));
+        cudaMemcpy(d_act, h_act, K * sizeof(float), cudaMemcpyHostToDevice);
+        
+        tcq4_fwht_quantize_q8(d_act, d_q8, K, 1, stream);
+        cudaStreamSynchronize(stream);
+        
+        // Download and dequantize GPU result
+        block_q8_1 *h_q8 = (block_q8_1*)malloc(num_q8_blocks * sizeof(block_q8_1));
+        cudaMemcpy(h_q8, d_q8, num_q8_blocks * sizeof(block_q8_1), cudaMemcpyDeviceToHost);
+        
+        float *h_dequant_gpu = (float*)malloc(K * sizeof(float));
+        for (int b = 0; b < num_q8_blocks; b++) {
+            float d = __half2float(*(const half*)&h_q8[b]);
+            for (int i = 0; i < QK8_1; i++) {
+                h_dequant_gpu[b * QK8_1 + i] = d * (float)h_q8[b].qs[i];
+            }
+        }
+        
+        // Compare GPU dequant vs CPU FWHT reference
+        float max_err = 0.0f;
+        for (int i = 0; i < K; i++) {
+            float err = fabsf(h_dequant_gpu[i] - h_fwht_cpu[i]);
+            max_err = fmaxf(max_err, err);
+        }
+        printf("    TCQ4 FWHT+Q8 vs CPU FWHT ref: max_err=%.6f\n", max_err);
+        printf("    First 8 CPU FWHT: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_fwht_cpu[0], h_fwht_cpu[1], h_fwht_cpu[2], h_fwht_cpu[3],
+               h_fwht_cpu[4], h_fwht_cpu[5], h_fwht_cpu[6], h_fwht_cpu[7]);
+        printf("    First 8 GPU dequant: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_dequant_gpu[0], h_dequant_gpu[1], h_dequant_gpu[2], h_dequant_gpu[3],
+               h_dequant_gpu[4], h_dequant_gpu[5], h_dequant_gpu[6], h_dequant_gpu[7]);
+        printf("    TCQ4 FWHT+Q8: %s\n", (max_err < 0.02f) ? "PASSED" : "FAILED");
+        
+        cudaFree(d_act); cudaFree(d_q8);
+        free(h_act); free(h_fwht_cpu); free(h_q8); free(h_dequant_gpu);
+    }
+    
+    // Test 2d2: End-to-end TCQ4 W4A8 test (step=256 FWHT for both weights and activations)
+    printf("\n[2d2] End-to-end TCQ4 W4A8 test (step=256 FWHT)...\n");
+    {
+        const int N = 64, K = 1024;
+        const int num_tcq4_blocks = K / 256;
+        const int num_q8_blocks = K / QK8_1;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(N * sizeof(float));
+        
+        for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.03f) * 0.3f;
+        
+        // Reference: FP32 matmul (original space)
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+            h_out_ref[n] = sum;
+        }
+        
+        // Weight quantization: FWHT (step=256) then TCQ4
+        float *h_wgt_fwht = (float*)malloc(N * K * sizeof(float));
+        block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_tcq4_blocks * sizeof(block_tcq4_k32));
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwht + n * K, h_wgt + n * K, K * sizeof(float));
+            for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_wgt_fwht + n * K + i, 256);
+            quantize_row_tcq4_k32_ref(h_wgt_fwht + n * K, h_wgt_tcq4 + n * num_tcq4_blocks, K);
+        }
+        
+        // Upload weights
+        block_tcq4_k32 *d_wgt;
+        cudaMalloc(&d_wgt, N * num_tcq4_blocks * sizeof(block_tcq4_k32));
+        cudaMemcpy(d_wgt, h_wgt_tcq4, N * num_tcq4_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+        
+        // Activation path: use tcq4_fwht_quantize_q8 (step=256 FWHT + Q8_1)
+        float *d_act;
+        block_q8_1 *d_q8;
+        float *d_out;
+        cudaMalloc(&d_act, K * sizeof(float));
+        cudaMalloc(&d_q8, num_q8_blocks * sizeof(block_q8_1));
+        cudaMalloc(&d_out, N * sizeof(float));
+        cudaMemcpy(d_act, h_act, K * sizeof(float), cudaMemcpyHostToDevice);
+        
+        tcq4_fwht_quantize_q8(d_act, d_q8, K, 1, stream);
+        cudaStreamSynchronize(stream);
+        
+        // Run TCQ4 x Q8 GEMV
+        tcq4_k32_q8_gemv(d_q8, d_wgt, d_out, N, K, stream);
+        cudaStreamSynchronize(stream);
+        
+        float *h_out_gpu = (float*)malloc(N * sizeof(float));
+        cudaMemcpy(h_out_gpu, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Compare
+        float max_err = 0.0f, sum_err = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float rel_err = fabsf(h_out_gpu[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            max_err = fmaxf(max_err, rel_err);
+            sum_err += rel_err;
+        }
+        printf("    TCQ4 W4A8 (step=256): max_rel_err=%.4f, avg_rel_err=%.4f\n", max_err, sum_err / N);
+        printf("    First 4 ref:  [%.4f, %.4f, %.4f, %.4f]\n", h_out_ref[0], h_out_ref[1], h_out_ref[2], h_out_ref[3]);
+        printf("    First 4 GPU:  [%.4f, %.4f, %.4f, %.4f]\n", h_out_gpu[0], h_out_gpu[1], h_out_gpu[2], h_out_gpu[3]);
+        printf("    TCQ4 W4A8: %s\n", (sum_err / N < 0.15f) ? "PASSED" : "FAILED");
+        
+        cudaFree(d_act); cudaFree(d_q8); cudaFree(d_wgt); cudaFree(d_out);
+        free(h_act); free(h_wgt); free(h_out_ref);
+        free(h_wgt_fwht); free(h_wgt_tcq4); free(h_out_gpu);
+    }
+    
+    // Test 2d3: Compare chunk-256 FWHT vs full-K FWHT
+    printf("\n[2d3] Comparing chunk-256 FWHT vs full-K FWHT...\n");
+    {
+        const int N = 32, K = 1024;
+        const int num_k_blocks = K / 256;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(N * sizeof(float));
+        
+        for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.03f) * 0.3f;
+        
+        // Reference: FP32 matmul
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+            h_out_ref[n] = sum;
+        }
+        
+        // Method A: Chunk-256 FWHT (current TCQ4 approach)
+        float *h_act_fwht256 = (float*)malloc(K * sizeof(float));
+        float *h_wgt_fwht256 = (float*)malloc(N * K * sizeof(float));
+        memcpy(h_act_fwht256, h_act, K * sizeof(float));
+        for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_act_fwht256 + i, 256);
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwht256 + n * K, h_wgt + n * K, K * sizeof(float));
+            for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_wgt_fwht256 + n * K + i, 256);
+        }
+        
+        // Method B: Full-K FWHT (Q4_K_RRS approach)
+        const int step = K & -K;  // = 1024 for K=1024
+        float *h_act_fwhtK = (float*)malloc(K * sizeof(float));
+        float *h_wgt_fwhtK = (float*)malloc(N * K * sizeof(float));
+        memcpy(h_act_fwhtK, h_act, K * sizeof(float));
+        for (int i = 0; i < K; i += step) ggml_fwht_impl(h_act_fwhtK + i, step);
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwhtK + n * K, h_wgt + n * K, K * sizeof(float));
+            for (int i = 0; i < K; i += step) ggml_fwht_impl(h_wgt_fwhtK + n * K + i, step);
+        }
+        
+        // Quantize both to TCQ4
+        block_tcq4_k32 *h_act_tcq4_256 = (block_tcq4_k32*)malloc(num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_wgt_tcq4_256 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_act_tcq4_K = (block_tcq4_k32*)malloc(num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_wgt_tcq4_K = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        
+        quantize_row_tcq4_k32_ref(h_act_fwht256, h_act_tcq4_256, K);
+        quantize_row_tcq4_k32_ref(h_act_fwhtK, h_act_tcq4_K, K);
+        for (int n = 0; n < N; n++) {
+            quantize_row_tcq4_k32_ref(h_wgt_fwht256 + n * K, h_wgt_tcq4_256 + n * num_k_blocks, K);
+            quantize_row_tcq4_k32_ref(h_wgt_fwhtK + n * K, h_wgt_tcq4_K + n * num_k_blocks, K);
+        }
+        
+        // Dequant and compute results
+        float *h_act_dq256 = (float*)malloc(K * sizeof(float));
+        float *h_wgt_dq256 = (float*)malloc(N * K * sizeof(float));
+        float *h_act_dqK = (float*)malloc(K * sizeof(float));
+        float *h_wgt_dqK = (float*)malloc(N * K * sizeof(float));
+        
+        dequantize_row_tcq4_k32(h_act_tcq4_256, h_act_dq256, K);
+        dequantize_row_tcq4_k32(h_act_tcq4_K, h_act_dqK, K);
+        for (int n = 0; n < N; n++) {
+            dequantize_row_tcq4_k32(h_wgt_tcq4_256 + n * num_k_blocks, h_wgt_dq256 + n * K, K);
+            dequantize_row_tcq4_k32(h_wgt_tcq4_K + n * num_k_blocks, h_wgt_dqK + n * K, K);
+        }
+        
+        float *h_out_256 = (float*)malloc(N * sizeof(float));
+        float *h_out_K = (float*)malloc(N * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            float sum256 = 0.0f, sumK = 0.0f;
+            for (int k = 0; k < K; k++) {
+                sum256 += h_act_dq256[k] * h_wgt_dq256[n * K + k];
+                sumK += h_act_dqK[k] * h_wgt_dqK[n * K + k];
+            }
+            h_out_256[n] = sum256;
+            h_out_K[n] = sumK;
+        }
+        
+        float max_err_256 = 0.0f, sum_err_256 = 0.0f;
+        float max_err_K = 0.0f, sum_err_K = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float rel_256 = fabsf(h_out_256[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            float rel_K = fabsf(h_out_K[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            max_err_256 = fmaxf(max_err_256, rel_256);
+            max_err_K = fmaxf(max_err_K, rel_K);
+            sum_err_256 += rel_256;
+            sum_err_K += rel_K;
+        }
+        printf("    Chunk-256 FWHT: max=%.4f, avg=%.4f\n", max_err_256, sum_err_256 / N);
+        printf("    Full-K FWHT:    max=%.4f, avg=%.4f\n", max_err_K, sum_err_K / N);
+        printf("    Full-K is %.1fx more accurate\n", (sum_err_256 / N) / (sum_err_K / N + 1e-9f));
+        
+        free(h_act); free(h_wgt); free(h_out_ref);
+        free(h_act_fwht256); free(h_wgt_fwht256);
+        free(h_act_fwhtK); free(h_wgt_fwhtK);
+        free(h_act_tcq4_256); free(h_wgt_tcq4_256);
+        free(h_act_tcq4_K); free(h_wgt_tcq4_K);
+        free(h_act_dq256); free(h_wgt_dq256);
+        free(h_act_dqK); free(h_wgt_dqK);
+        free(h_out_256); free(h_out_K);
+    }
+    
+    // Test 2e: Test with realistic K dimensions - also vary N to check sensitivity
+    printf("\n[2e] Testing with realistic model dimensions (vary N and K)...\n");
+    {
+        int test_dims[][2] = {{32, 256}, {32, 1024}, {32, 2048}, {32, 3072}, {64, 1024}, {128, 1024}};
+        const char* dim_names[] = {"N=32,K=256", "N=32,K=1024", "N=32,K=2048", "N=32,K=3072", "N=64,K=1024", "N=128,K=1024"};
+        
+        for (int t = 0; t < 6; t++) {
+            const int N = test_dims[t][0];
+            const int K = test_dims[t][1];
+            const int num_k_blocks = K / 256;
+            
+            float *h_act = (float*)malloc(K * sizeof(float));
+            float *h_wgt = (float*)malloc(N * K * sizeof(float));
+            float *h_out_ref = (float*)malloc(N * sizeof(float));
+            
+            for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+            for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.03f) * 0.3f;
+            
+            // Reference: FP32 matmul
+            for (int n = 0; n < N; n++) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+                h_out_ref[n] = sum;
+            }
+            
+            // Apply FWHT (in 256-element chunks like TCQ4)
+            float *h_act_fwht = (float*)malloc(K * sizeof(float));
+            float *h_wgt_fwht = (float*)malloc(N * K * sizeof(float));
+            memcpy(h_act_fwht, h_act, K * sizeof(float));
+            for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_act_fwht + i, 256);
+            for (int n = 0; n < N; n++) {
+                memcpy(h_wgt_fwht + n * K, h_wgt + n * K, K * sizeof(float));
+                for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_wgt_fwht + n * K + i, 256);
+            }
+            
+            // Quantize to TCQ4
+            block_tcq4_k32 *h_act_tcq4 = (block_tcq4_k32*)malloc(num_k_blocks * sizeof(block_tcq4_k32));
+            block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+            quantize_row_tcq4_k32_ref(h_act_fwht, h_act_tcq4, K);
+            for (int n = 0; n < N; n++) {
+                quantize_row_tcq4_k32_ref(h_wgt_fwht + n * K, h_wgt_tcq4 + n * num_k_blocks, K);
+            }
+            
+            // Run CUDA GEMV
+            block_tcq4_k32 *d_act, *d_wgt;
+            float *d_out;
+            cudaMalloc(&d_act, num_k_blocks * sizeof(block_tcq4_k32));
+            cudaMalloc(&d_wgt, N * num_k_blocks * sizeof(block_tcq4_k32));
+            cudaMalloc(&d_out, N * sizeof(float));
+            cudaMemcpy(d_act, h_act_tcq4, num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_wgt, h_wgt_tcq4, N * num_k_blocks * sizeof(block_tcq4_k32), cudaMemcpyHostToDevice);
+            
+            tcq4_k32_gemv(d_act, d_wgt, d_out, N, K, stream);
+            cudaStreamSynchronize(stream);
+            
+            float *h_out_tcq4 = (float*)malloc(N * sizeof(float));
+            cudaMemcpy(h_out_tcq4, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);
+            
+            float max_err = 0.0f, sum_err = 0.0f;
+            int max_idx = 0;
+            float max_ref = 0.0f, max_tcq4 = 0.0f;
+            for (int n = 0; n < N; n++) {
+                float rel_err = fabsf(h_out_tcq4[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+                if (rel_err > max_err) {
+                    max_err = rel_err;
+                    max_idx = n;
+                    max_ref = h_out_ref[n];
+                    max_tcq4 = h_out_tcq4[n];
+                }
+                sum_err += rel_err;
+            }
+            printf("    %s: max_rel_err=%.4f (idx=%d, ref=%.6f, tcq4=%.6f), avg=%.4f %s\n", 
+                   dim_names[t], max_err, max_idx, max_ref, max_tcq4, sum_err / N, 
+                   (sum_err / N < 0.1f) ? "OK" : "HIGH");
+            
+            cudaFree(d_act); cudaFree(d_wgt); cudaFree(d_out);
+            free(h_act); free(h_wgt); free(h_out_ref); free(h_out_tcq4);
+            free(h_act_fwht); free(h_wgt_fwht);
+            free(h_act_tcq4); free(h_wgt_tcq4);
+        }
+    }
+    
+    // Test 2f: Direct comparison of Q4_K_RRS vs TCQ4 on same data
+    printf("\n[2f] Direct Q4_K_RRS vs TCQ4 comparison...\n");
+    {
+        const int N = 64, K = 1024;
+        const int num_k_blocks = K / 256;
+        const int num_q8_blocks = K / QK8_1;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(N * sizeof(float));
+        
+        for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.03f) * 0.3f;
+        
+        // Reference: FP32 matmul
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+            h_out_ref[n] = sum;
+        }
+        
+        // Q4_K_RRS path: FWHT with step=K&-K, quant to Q4_K (weights) + Q8_1 (activations)
+        const int step_rrs = K & -K;  // 1024 for K=1024
+        float *h_act_fwht_rrs = (float*)malloc(K * sizeof(float));
+        float *h_wgt_fwht_rrs = (float*)malloc(N * K * sizeof(float));
+        memcpy(h_act_fwht_rrs, h_act, K * sizeof(float));
+        for (int i = 0; i < K; i += step_rrs) ggml_fwht_impl(h_act_fwht_rrs + i, step_rrs);
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwht_rrs + n * K, h_wgt + n * K, K * sizeof(float));
+            for (int i = 0; i < K; i += step_rrs) ggml_fwht_impl(h_wgt_fwht_rrs + n * K + i, step_rrs);
+        }
+        
+        // Quantize weights to Q4_K, activations to Q8_1 (like Q4_K_RRS runtime)
+        block_q4_K *h_wgt_q4k = (block_q4_K*)malloc(N * (K / QK_K) * sizeof(block_q4_K));
+        block_q8_1 *h_act_q8 = (block_q8_1*)malloc(num_q8_blocks * sizeof(block_q8_1));
+        for (int n = 0; n < N; n++) {
+            quantize_row_q4_K_ref(h_wgt_fwht_rrs + n * K, h_wgt_q4k + n * (K / QK_K), K);
+        }
+        quantize_row_q8_1_ref(h_act_fwht_rrs, h_act_q8, K);
+        
+        // Debug: check q8_1 block content
+        printf("    DEBUG q8_1[0]: d_raw=0x%04x, qs[0..3]=[%d,%d,%d,%d]\n",
+               *(uint16_t*)&h_act_q8[0].ds.x, 
+               (int)h_act_q8[0].qs[0], (int)h_act_q8[0].qs[1], 
+               (int)h_act_q8[0].qs[2], (int)h_act_q8[0].qs[3]);
+        
+        // Dequant and compute Q4_K_RRS result
+        float *h_wgt_dq_rrs = (float*)malloc(N * K * sizeof(float));
+        float *h_act_dq_rrs = (float*)malloc(K * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            dequantize_row_q4_K(h_wgt_q4k + n * (K / QK_K), h_wgt_dq_rrs + n * K, K);
+        }
+        dequantize_row_q8_1_inline(h_act_q8, h_act_dq_rrs, K);
+        
+        float *h_out_rrs = (float*)malloc(N * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act_dq_rrs[k] * h_wgt_dq_rrs[n * K + k];
+            h_out_rrs[n] = sum;
+        }
+        
+        // TCQ4 path: FWHT with step=256, quant to TCQ4 (both)
+        float *h_act_fwht_tcq4 = (float*)malloc(K * sizeof(float));
+        float *h_wgt_fwht_tcq4 = (float*)malloc(N * K * sizeof(float));
+        memcpy(h_act_fwht_tcq4, h_act, K * sizeof(float));
+        for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_act_fwht_tcq4 + i, 256);
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwht_tcq4 + n * K, h_wgt + n * K, K * sizeof(float));
+            for (int i = 0; i < K; i += 256) ggml_fwht_impl(h_wgt_fwht_tcq4 + n * K + i, 256);
+        }
+        
+        block_tcq4_k32 *h_act_tcq4 = (block_tcq4_k32*)malloc(num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        quantize_row_tcq4_k32_ref(h_act_fwht_tcq4, h_act_tcq4, K);
+        for (int n = 0; n < N; n++) {
+            quantize_row_tcq4_k32_ref(h_wgt_fwht_tcq4 + n * K, h_wgt_tcq4 + n * num_k_blocks, K);
+        }
+        
+        float *h_wgt_dq_tcq4 = (float*)malloc(N * K * sizeof(float));
+        float *h_act_dq_tcq4 = (float*)malloc(K * sizeof(float));
+        dequantize_row_tcq4_k32(h_act_tcq4, h_act_dq_tcq4, K);
+        for (int n = 0; n < N; n++) {
+            dequantize_row_tcq4_k32(h_wgt_tcq4 + n * num_k_blocks, h_wgt_dq_tcq4 + n * K, K);
+        }
+        
+        float *h_out_tcq4 = (float*)malloc(N * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act_dq_tcq4[k] * h_wgt_dq_tcq4[n * K + k];
+            h_out_tcq4[n] = sum;
+        }
+        
+        // Debug: print first few values
+        printf("    First 4 ref:  [%.4f, %.4f, %.4f, %.4f]\n", h_out_ref[0], h_out_ref[1], h_out_ref[2], h_out_ref[3]);
+        printf("    First 4 RRS:  [%.4f, %.4f, %.4f, %.4f]\n", h_out_rrs[0], h_out_rrs[1], h_out_rrs[2], h_out_rrs[3]);
+        printf("    First 4 TCQ4: [%.4f, %.4f, %.4f, %.4f]\n", h_out_tcq4[0], h_out_tcq4[1], h_out_tcq4[2], h_out_tcq4[3]);
+        printf("    First 8 act_dq_rrs: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_act_dq_rrs[0], h_act_dq_rrs[1], h_act_dq_rrs[2], h_act_dq_rrs[3],
+               h_act_dq_rrs[4], h_act_dq_rrs[5], h_act_dq_rrs[6], h_act_dq_rrs[7]);
+        printf("    First 8 act_fwht_rrs: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_act_fwht_rrs[0], h_act_fwht_rrs[1], h_act_fwht_rrs[2], h_act_fwht_rrs[3],
+               h_act_fwht_rrs[4], h_act_fwht_rrs[5], h_act_fwht_rrs[6], h_act_fwht_rrs[7]);
+        
+        // Compare
+        float max_err_rrs = 0.0f, sum_err_rrs = 0.0f;
+        float max_err_tcq4 = 0.0f, sum_err_tcq4 = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float rel_rrs = fabsf(h_out_rrs[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            float rel_tcq4 = fabsf(h_out_tcq4[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            max_err_rrs = fmaxf(max_err_rrs, rel_rrs);
+            max_err_tcq4 = fmaxf(max_err_tcq4, rel_tcq4);
+            sum_err_rrs += rel_rrs;
+            sum_err_tcq4 += rel_tcq4;
+        }
+        printf("    Q4_K_RRS (W4A8, step=%d): max=%.4f, avg=%.4f\n", step_rrs, max_err_rrs, sum_err_rrs / N);
+        printf("    TCQ4 (W4A4, step=256):    max=%.4f, avg=%.4f\n", max_err_tcq4, sum_err_tcq4 / N);
+        printf("    Q4_K_RRS is %.1fx more accurate\n", (sum_err_tcq4 / N) / (sum_err_rrs / N + 1e-9f));
+        
+        free(h_act); free(h_wgt); free(h_out_ref);
+        free(h_act_fwht_rrs); free(h_wgt_fwht_rrs);
+        free(h_wgt_q4k); free(h_act_q8);
+        free(h_wgt_dq_rrs); free(h_act_dq_rrs); free(h_out_rrs);
+        free(h_act_fwht_tcq4); free(h_wgt_fwht_tcq4);
+        free(h_act_tcq4); free(h_wgt_tcq4);
+        free(h_wgt_dq_tcq4); free(h_act_dq_tcq4); free(h_out_tcq4);
+    }
+    
+    // Test 2g: Compare W4A8 (TCQ4 weights + FP32 activations) vs W4A4
+    printf("\n[2g] Testing W4A4 vs W4Afp32 accuracy...\n");
+    {
+        const int N = 64, K = 1024;
+        const int num_k_blocks = K / 256;
+        
+        float *h_act = (float*)malloc(K * sizeof(float));
+        float *h_wgt = (float*)malloc(N * K * sizeof(float));
+        float *h_out_ref = (float*)malloc(N * sizeof(float));
+        
+        for (int i = 0; i < K; i++) h_act[i] = sinf((float)i * 0.05f) * 0.5f;
+        for (int i = 0; i < N * K; i++) h_wgt[i] = cosf((float)i * 0.03f) * 0.3f;
+        
+        // Reference: FP32 matmul
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act[k] * h_wgt[n * K + k];
+            h_out_ref[n] = sum;
+        }
+        
+        // Apply FWHT to both (simulating RRS)
+        float *h_act_fwht = (float*)malloc(K * sizeof(float));
+        float *h_wgt_fwht = (float*)malloc(N * K * sizeof(float));
+        memcpy(h_act_fwht, h_act, K * sizeof(float));
+        ggml_fwht_impl(h_act_fwht, K);
+        for (int n = 0; n < N; n++) {
+            memcpy(h_wgt_fwht + n * K, h_wgt + n * K, K * sizeof(float));
+            ggml_fwht_impl(h_wgt_fwht + n * K, K);
+        }
+        
+        // W4A4: Both as TCQ4
+        block_tcq4_k32 *h_act_tcq4 = (block_tcq4_k32*)malloc(num_k_blocks * sizeof(block_tcq4_k32));
+        block_tcq4_k32 *h_wgt_tcq4 = (block_tcq4_k32*)malloc(N * num_k_blocks * sizeof(block_tcq4_k32));
+        quantize_row_tcq4_k32_ref(h_act_fwht, h_act_tcq4, K);
+        for (int n = 0; n < N; n++) {
+            quantize_row_tcq4_k32_ref(h_wgt_fwht + n * K, h_wgt_tcq4 + n * num_k_blocks, K);
+        }
+        
+        // Dequant weights (both tests use same quantized weights)
+        float *h_act_dq4 = (float*)malloc(K * sizeof(float));
+        float *h_wgt_dq4 = (float*)malloc(N * K * sizeof(float));
+        dequantize_row_tcq4_k32(h_act_tcq4, h_act_dq4, K);
+        for (int n = 0; n < N; n++) {
+            dequantize_row_tcq4_k32(h_wgt_tcq4 + n * num_k_blocks, h_wgt_dq4 + n * K, K);
+        }
+        
+        // W4A4: dequant_act × dequant_wgt
+        float *h_out_w4a4 = (float*)malloc(N * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act_dq4[k] * h_wgt_dq4[n * K + k];
+            h_out_w4a4[n] = sum;
+        }
+        
+        // W4Afp32: fp32_fwht_act × dequant_wgt (proxy for W4A8)
+        float *h_out_w4afp = (float*)malloc(N * sizeof(float));
+        for (int n = 0; n < N; n++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) sum += h_act_fwht[k] * h_wgt_dq4[n * K + k];
+            h_out_w4afp[n] = sum;
+        }
+        
+        // Compare errors
+        float max_err_w4a4 = 0.0f, sum_err_w4a4 = 0.0f;
+        float max_err_w4afp = 0.0f, sum_err_w4afp = 0.0f;
+        for (int n = 0; n < N; n++) {
+            float rel_w4a4 = fabsf(h_out_w4a4[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            float rel_w4afp = fabsf(h_out_w4afp[n] - h_out_ref[n]) / (fabsf(h_out_ref[n]) + 1e-6f);
+            max_err_w4a4 = fmaxf(max_err_w4a4, rel_w4a4);
+            max_err_w4afp = fmaxf(max_err_w4afp, rel_w4afp);
+            sum_err_w4a4 += rel_w4a4;
+            sum_err_w4afp += rel_w4afp;
+        }
+        printf("    W4A4 rel error: max=%.4f, avg=%.4f\n", max_err_w4a4, sum_err_w4a4 / N);
+        printf("    W4Afp32 rel error: max=%.4f, avg=%.4f\n", max_err_w4afp, sum_err_w4afp / N);
+        printf("    W4Afp32 is %.1fx more accurate than W4A4\n", (sum_err_w4a4 / N) / (sum_err_w4afp / N + 1e-9f));
+        free(h_act); free(h_wgt); free(h_out_ref);
+        free(h_act_fwht); free(h_wgt_fwht);
+        free(h_act_tcq4); free(h_wgt_tcq4);
+        free(h_act_dq4); free(h_wgt_dq4); free(h_out_w4a4); free(h_out_w4afp);
+    }
+    
+    // Test 2c: Verify CPU vs GPU FWHT consistency
+    printf("\n[2c] Testing CPU vs GPU FWHT consistency...\n");
+    {
+        const int K = 256;
+        float *h_data = (float*)malloc(K * sizeof(float));
+        float *h_fwht_cpu = (float*)malloc(K * sizeof(float));
+        float *h_fwht_gpu = (float*)malloc(K * sizeof(float));
+        
+        for (int i = 0; i < K; i++) h_data[i] = sinf((float)i * 0.1f);
+        
+        // CPU FWHT
+        memcpy(h_fwht_cpu, h_data, K * sizeof(float));
+        ggml_fwht_impl(h_fwht_cpu, K);
+        
+        // GPU FWHT via tcq4_k32_fwht_quantize (extract FWHT result before quant)
+        float *d_data;
+        block_tcq4_k32 *d_tcq4;
+        cudaMalloc(&d_data, K * sizeof(float));
+        cudaMalloc(&d_tcq4, sizeof(block_tcq4_k32));
+        cudaMemcpy(d_data, h_data, K * sizeof(float), cudaMemcpyHostToDevice);
+        
+        tcq4_k32_fwht_quantize(d_data, d_tcq4, K, 1, stream);
+        cudaStreamSynchronize(stream);
+        
+        // Dequant GPU result to compare
+        block_tcq4_k32 h_tcq4;
+        cudaMemcpy(&h_tcq4, d_tcq4, sizeof(block_tcq4_k32), cudaMemcpyDeviceToHost);
+        dequantize_row_tcq4_k32(&h_tcq4, h_fwht_gpu, K);
+        
+        // Also dequant CPU FWHT result via same quantizer for apples-to-apples
+        block_tcq4_k32 h_tcq4_cpu;
+        quantize_row_tcq4_k32_ref(h_fwht_cpu, &h_tcq4_cpu, K);
+        float *h_fwht_cpu_roundtrip = (float*)malloc(K * sizeof(float));
+        dequantize_row_tcq4_k32(&h_tcq4_cpu, h_fwht_cpu_roundtrip, K);
+        
+        float max_err = 0.0f;
+        for (int i = 0; i < K; i++) {
+            float err = fabsf(h_fwht_gpu[i] - h_fwht_cpu_roundtrip[i]);
+            max_err = fmaxf(max_err, err);
+        }
+        printf("    CPU vs GPU FWHT+quant dequant max error: %.6f\n", max_err);
+        printf("    FWHT consistency: %s\n", (max_err < 0.1f) ? "PASSED" : "FAILED");
+        
+        // Print raw FWHT values for first 8 elements
+        printf("    CPU FWHT[0:7]: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+               h_fwht_cpu[0], h_fwht_cpu[1], h_fwht_cpu[2], h_fwht_cpu[3],
+               h_fwht_cpu[4], h_fwht_cpu[5], h_fwht_cpu[6], h_fwht_cpu[7]);
+        
+        cudaFree(d_data); cudaFree(d_tcq4);
+        free(h_data); free(h_fwht_cpu); free(h_fwht_gpu); free(h_fwht_cpu_roundtrip);
+    }
+    
+    // Test 3: Benchmark
+    printf("\n[3] Benchmarking GEMV (M=1, N=2048, K=2048)...\n");
+    TCQ4BenchResult res_gemv;
+    tcq4_k32_benchmark(1, 2048, 2048, 100, &res_gemv, stream);
+    tcq4_k32_print_benchmark(&res_gemv);
+    
+    cudaStreamDestroy(stream);
+    printf("\n=== TCQ4-K32 Test Complete ===\n");
 }

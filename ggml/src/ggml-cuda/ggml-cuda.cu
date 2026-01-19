@@ -2148,7 +2148,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const ggml_tensor * dst  = tensor;
 
     // RRS types use their own GEMM path, not MMVQ
-    if (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT) {
+    if (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT || src0->type == GGML_TYPE_TCQ4_K32) {
         return false;
     }
 
@@ -2191,6 +2191,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_rrs_mul_mat(ctx, src0, src1, dst);
         return;
     }
+    // TCQ4-K32: Tensor Core native INT4 path
+    if (src0->type == GGML_TYPE_TCQ4_K32) {
+        ggml_cuda_rrs_mul_mat(ctx, src0, src1, dst);  // Uses same RRS dispatch
+        return;
+    }
 
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -2205,7 +2210,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     // RRS types already handled above, exclude from MMVQ/MMQ paths
-    bool is_rrs_type = (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT);
+    bool is_rrs_type = (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT || src0->type == GGML_TYPE_TCQ4_K32);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_rrs_type
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
@@ -2292,7 +2297,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // RRS types use their own GEMM path
-    const bool is_rrs_type = (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT);
+    const bool is_rrs_type = (src0->type == GGML_TYPE_Q4_K_RRS || src0->type == GGML_TYPE_Q4_K_RRS_ACT || src0->type == GGML_TYPE_TCQ4_K32);
 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ne2 == 1) {
@@ -4436,6 +4441,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_Q4_K_RRS:  // RRS W4A4 with INT4 tensor cores
+                    case GGML_TYPE_TCQ4_K32:  // TCQ4-K32 Tensor Core native INT4
                         return true;
                     default:
                         return false;
@@ -4456,6 +4462,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q4_K_RRS:
+                    case GGML_TYPE_TCQ4_K32:
                         return true;
                     default:
                         return false;

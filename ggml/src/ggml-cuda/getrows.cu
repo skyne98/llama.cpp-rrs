@@ -2,6 +2,7 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 #include "rrs.cuh"
+#include "tcq4_k32.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -90,6 +91,59 @@ static __global__ void k_get_rows_back_float(
     }
 
     dst[dst_row*ncols + col] = sum;
+}
+
+// Special kernel for TCQ4_K32 get_rows (dequantize to float)
+template<typename dst_t>
+static __global__ void k_get_rows_tcq4_k32(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, 
+        const int64_t ne11, const int64_t ne12, 
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+        for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+            const int i10 =  blockIdx.x;
+            const int i11 =  z / ne12;
+            const int i12 =  z % ne12;
+
+            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+            dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+            // TCQ4_K32 uses 256-element blocks
+            const block_tcq4_k32 * src0_row = (const block_tcq4_k32 *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+
+            const int ib = i00 / TCQ4_K32_BLOCK_SIZE;  // block index
+            const int iq = i00 % TCQ4_K32_BLOCK_SIZE;  // element within block
+            
+            const block_tcq4_k32 * b = src0_row + ib;
+            
+            const float S = __half2float(b->S);
+            const float Z = __half2float(b->Z);
+            
+            // 8 groups of 32 elements
+            const int group = iq / TCQ4_K32_GROUP_SIZE;
+            const float scale = S * (float)b->sc[group];
+            const float zero = Z * (float)b->zc[group];
+            
+            // Unpack INT4 (2 values per byte)
+            const int byte_idx = iq / 2;
+            const uint8_t packed = b->qs[byte_idx];
+            
+            int8_t val;
+            if (iq % 2 == 0) {
+                val = (int8_t)(packed & 0x0F);
+            } else {
+                val = (int8_t)((packed >> 4) & 0x0F);
+            }
+            // Convert unsigned 4-bit to signed: values 8-15 become -8 to -1
+            val = (val >= 8) ? (val - 16) : val;
+            
+            dst_row[i00] = ggml_cuda_cast<dst_t>(scale * (float)val + zero);
+        }
+    }
 }
 
 // Special kernel for Q4_K_RRS get_rows
@@ -267,6 +321,40 @@ void get_rows_cuda(
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream) {
+    // Handle TCQ4_K32 specially - requires float output and inverse FWHT (step=256)
+    // TCQ4_K32 weights are stored in FWHT domain, need inverse transform for embedding lookup
+    if (src0_type == GGML_TYPE_TCQ4_K32) {
+        GGML_ASSERT(dst_type == GGML_TYPE_F32 && "TCQ4_K32 GET_ROWS requires F32 destination");
+        
+        const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+        const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+        // Strides in elements
+        const size_t s1 = nb1 / sizeof(float);
+        const size_t s2 = nb2 / sizeof(float);
+        const size_t s3 = nb3 / sizeof(float);
+        const size_t s10 = nb10 / sizeof(int32_t);
+        const size_t s11 = nb11 / sizeof(int32_t);
+        const size_t s12 = nb12 / sizeof(int32_t);
+
+        k_get_rows_tcq4_k32<float><<<block_nums, block_dims, 0, stream>>>(
+            src0_d, src1_d, (float*)dst_d,
+            ne00, ne11, ne12,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+
+        // Apply inverse FWHT to convert from Hadamard domain back to spatial domain
+        // TCQ4_K32 uses step=256 for FWHT (matches block size)
+        // FWHT is self-inverse (H * H = n * I), so applying FWHT again gives inverse
+        if (ne10 > 0) {
+            // Apply FWHT in 256-element chunks (matching TCQ4 quantization step)
+            ggml_cuda_tcq4_fwht_step256((float*)dst_d, (float*)dst_d, ne00, ne10, stream);
+        }
+        return;
+    }
+    
     // Handle Q4_K_RRS specially - requires float output and inverse FWHT
     if (src0_type == GGML_TYPE_Q4_K_RRS) {
         GGML_ASSERT(dst_type == GGML_TYPE_F32 && "Q4_K_RRS GET_ROWS requires F32 destination");
