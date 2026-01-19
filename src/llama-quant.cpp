@@ -13,6 +13,32 @@
 #include <thread>
 #include <unordered_map>
 
+// TCQ4 channel reordering GGUF key prefix (RRS paper Section 3.2)
+static const char * const TCQ4_PERM_KEY_PREFIX = "tcq4.";
+static const char * const TCQ4_PERM_KEY_SUFFIX = ".perm";
+static const char * const TCQ4_REORDER_ENABLED_KEY = "tcq4.reorder.enabled";
+
+// Apply channel permutation to weight matrix columns
+// Reorders columns: w_out[:, i] = w_in[:, perm[i]]
+// w_in:  [nrows, n_per_row] row-major
+// w_out: [nrows, n_per_row] row-major  
+// perm:  [n_per_row] permutation indices
+static void apply_channel_perm_to_weights(
+    const float * w_in,
+    float * w_out,
+    const int32_t * perm,
+    int64_t nrows,
+    int64_t n_per_row
+) {
+    for (int64_t row = 0; row < nrows; row++) {
+        const float * src_row = w_in + row * n_per_row;
+        float * dst_row = w_out + row * n_per_row;
+        for (int64_t col = 0; col < n_per_row; col++) {
+            dst_row[col] = src_row[perm[col]];
+        }
+    }
+}
+
 // Quantization types. Changes to this struct must be replicated in quantize.cpp
 struct tensor_quantization {
     std::string name;
@@ -987,7 +1013,28 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                 const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                // For TCQ4_K32 with channel reordering, apply permutation before quantization
+                const float * data_to_quantize = f32_data_03;
+                std::vector<float> permuted_data;
+            
+                if (new_type == GGML_TYPE_TCQ4_K32 && params->tcq4_perms) {
+                    const auto * tcq4_perms = static_cast<const std::unordered_map<std::string, std::vector<int32_t>> *>(params->tcq4_perms);
+                    auto perm_it = tcq4_perms->find(name);
+                    if (perm_it != tcq4_perms->end()) {
+                        const std::vector<int32_t> & perm = perm_it->second;
+                        if ((int64_t)perm.size() == n_per_row) {
+                            LLAMA_LOG_INFO("(reordering channels) ");
+                            permuted_data.resize(nrows * n_per_row);
+                            apply_channel_perm_to_weights(f32_data_03, permuted_data.data(), perm.data(), nrows, n_per_row);
+                            data_to_quantize = permuted_data.data();
+                        } else {
+                            LLAMA_LOG_WARN("TCQ4 perm size mismatch for %s: expected %lld, got %zu\n", 
+                                           name.c_str(), (long long)n_per_row, perm.size());
+                        }
+                    }
+                }
+            
+                new_size += llama_tensor_quantize_impl(new_type, data_to_quantize, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
 
                 // TODO: temporary sanity check that the F16 -> MXFP4 is lossless
 #if 0
@@ -1028,6 +1075,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
     close_ofstream();
 
+    // Write TCQ4 channel permutations to GGUF metadata (for runtime reordering)
+    if (params->tcq4_perms && default_type == GGML_TYPE_TCQ4_K32) {
+        const auto * tcq4_perms = static_cast<const std::unordered_map<std::string, std::vector<int32_t>> *>(params->tcq4_perms);
+        
+        if (!tcq4_perms->empty()) {
+            LLAMA_LOG_INFO("%s: writing %zu TCQ4 channel permutations to GGUF\n", __func__, tcq4_perms->size());
+            
+            // Set global reorder enabled flag
+            gguf_set_val_bool(ctx_outs[0].get(), TCQ4_REORDER_ENABLED_KEY, true);
+            
+            // Write each permutation array
+            for (const auto & [tensor_name, perm] : *tcq4_perms) {
+                std::string perm_key = std::string(TCQ4_PERM_KEY_PREFIX) + tensor_name + TCQ4_PERM_KEY_SUFFIX;
+                gguf_set_arr_data(ctx_outs[0].get(), perm_key.c_str(), GGUF_TYPE_INT32, perm.data(), perm.size());
+            }
+        }
+    }
+
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB\n", __func__, total_size_new/1024.0/1024.0);
 
@@ -1055,7 +1120,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.tcq4_perms                  =*/ nullptr
     };
 
     return result;

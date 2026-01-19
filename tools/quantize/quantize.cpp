@@ -74,6 +74,9 @@ static const char * const LLM_KV_QUANTIZE_IMATRIX_DATASET    = "quantize.imatrix
 static const char * const LLM_KV_QUANTIZE_IMATRIX_N_ENTRIES  = "quantize.imatrix.entries_count";
 static const char * const LLM_KV_QUANTIZE_IMATRIX_N_CHUNKS   = "quantize.imatrix.chunks_count";
 
+// TCQ4 channel reordering GGUF keys (RRS paper Section 3.2)
+static const char * const LLM_KV_TCQ4_REORDER_ENABLED        = "tcq4.reorder.enabled";
+
 // TODO: share with imatrix.cpp
 static const char * const LLM_KV_IMATRIX_DATASETS    = "imatrix.datasets";
 static const char * const LLM_KV_IMATRIX_CHUNK_COUNT = "imatrix.chunk_count";
@@ -118,10 +121,119 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
     return false;
 }
 
+// Load TCQ4 channel permutations from JSON file
+// Returns true on success, false on failure
+static bool load_tcq4_perms(const std::string & filename, std::unordered_map<std::string, std::vector<int32_t>> & perms) {
+    std::ifstream f(filename);
+    if (!f.is_open()) {
+        fprintf(stderr, "%s: failed to open TCQ4 perms file '%s'\n", __func__, filename.c_str());
+        return false;
+    }
+
+    std::stringstream buffer;
+    buffer << f.rdbuf();
+    std::string json = buffer.str();
+
+    // Very simple JSON parser for our specific format
+    // Find "permutations" object
+    size_t perm_pos = json.find("\"permutations\"");
+    if (perm_pos == std::string::npos) {
+        fprintf(stderr, "%s: no 'permutations' key found in JSON\n", __func__);
+        return false;
+    }
+
+    // Find the opening brace of permutations object
+    size_t obj_start = json.find('{', perm_pos);
+    if (obj_start == std::string::npos) {
+        fprintf(stderr, "%s: malformed JSON - no permutations object\n", __func__);
+        return false;
+    }
+
+    // Parse each tensor's permutation array
+    size_t pos = obj_start + 1;
+    int brace_depth = 1;
+    
+    while (pos < json.size() && brace_depth > 0) {
+        // Skip whitespace
+        while (pos < json.size() && std::isspace(json[pos])) pos++;
+        
+        if (json[pos] == '}') {
+            brace_depth--;
+            pos++;
+            continue;
+        }
+        
+        if (json[pos] == ',') {
+            pos++;
+            continue;
+        }
+
+        // Expect a string key (tensor name)
+        if (json[pos] != '"') {
+            pos++;
+            continue;
+        }
+        
+        // Parse tensor name
+        size_t name_start = pos + 1;
+        size_t name_end = json.find('"', name_start);
+        if (name_end == std::string::npos) break;
+        
+        std::string tensor_name = json.substr(name_start, name_end - name_start);
+        pos = name_end + 1;
+        
+        // Skip to colon
+        while (pos < json.size() && json[pos] != ':') pos++;
+        if (pos >= json.size()) break;
+        pos++; // skip colon
+        
+        // Skip whitespace
+        while (pos < json.size() && std::isspace(json[pos])) pos++;
+        
+        // Expect array
+        if (json[pos] != '[') {
+            fprintf(stderr, "%s: expected array for tensor '%s'\n", __func__, tensor_name.c_str());
+            continue;
+        }
+        pos++; // skip '['
+        
+        // Parse array of integers
+        std::vector<int32_t> perm;
+        while (pos < json.size() && json[pos] != ']') {
+            // Skip whitespace and commas
+            while (pos < json.size() && (std::isspace(json[pos]) || json[pos] == ',')) pos++;
+            if (json[pos] == ']') break;
+            
+            // Parse integer
+            int32_t val = 0;
+            bool negative = false;
+            if (json[pos] == '-') {
+                negative = true;
+                pos++;
+            }
+            while (pos < json.size() && std::isdigit(json[pos])) {
+                val = val * 10 + (json[pos] - '0');
+                pos++;
+            }
+            if (negative) val = -val;
+            perm.push_back(val);
+        }
+        
+        if (json[pos] == ']') pos++; // skip ']'
+        
+        if (!perm.empty()) {
+            perms[tensor_name] = std::move(perm);
+        }
+    }
+
+    fprintf(stderr, "%s: loaded %zu tensor permutations from '%s'\n", __func__, perms.size(), filename.c_str());
+    return true;
+}
+
 [[noreturn]]
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
-    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--prune-layers] [--keep-split] [--override-kv]\n");
+    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--prune-layers] [--keep-split] [--override-kv] [--tcq4-perms]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
@@ -138,6 +250,9 @@ static void usage(const char * executable) {
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n");
+    printf("  --tcq4-perms file_name: use channel permutations from JSON file for TCQ4_K32 quantization (RRS paper Section 3.2)\n");
+    printf("      The JSON file should have format: {\"reorder_enabled\": true, \"permutations\": {\"tensor_name\": [0, 1, 2, ...], ...}}\n");
+    printf("      Generate with: python tools/tcq4-calibrate/calibrate.py --model model.gguf --output perms.json\n");
     printf("Note: --include-weights and --exclude-weights cannot be used together\n");
     printf("\nAllowed quantization types:\n");
     for (const auto & it : QUANT_OPTIONS) {
@@ -452,10 +567,12 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string tcq4_perms_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_quantization> tensor_types;
     std::vector<int> prune_layers;
+    std::unordered_map<std::string, std::vector<int32_t>> tcq4_perms_data;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
@@ -514,6 +631,12 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--tcq4-perms") == 0) {
+            if (arg_idx < argc-1) {
+                tcq4_perms_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else {
             usage(argv[0]);
         }
@@ -555,6 +678,24 @@ int main(int argc, char ** argv) {
             std::strcpy(kvo.key, LLM_KV_QUANTIZE_IMATRIX_N_ENTRIES);
             kvo.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
             kvo.val_i64 = imatrix_data.size();
+            kv_overrides.emplace_back(std::move(kvo));
+        }
+    }
+
+    // Load TCQ4 channel permutations if provided
+    if (!tcq4_perms_file.empty()) {
+        if (!load_tcq4_perms(tcq4_perms_file, tcq4_perms_data)) {
+            fprintf(stderr, "%s: failed to load TCQ4 permutations from '%s'\n", __func__, tcq4_perms_file.c_str());
+            return 1;
+        }
+        params.tcq4_perms = &tcq4_perms_data;
+        
+        // Add GGUF metadata to enable reordering at runtime
+        {
+            llama_model_kv_override kvo;
+            std::strcpy(kvo.key, LLM_KV_TCQ4_REORDER_ENABLED);
+            kvo.tag = LLAMA_KV_OVERRIDE_TYPE_BOOL;
+            kvo.val_bool = true;
             kv_overrides.emplace_back(std::move(kvo));
         }
 

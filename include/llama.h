@@ -395,6 +395,7 @@ extern "C" {
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types
         void * prune_layers;                  // pointer to vector containing layer indices to prune
+        void * tcq4_perms;                    // pointer to map<string, vector<int32_t>> for TCQ4 channel permutations
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
