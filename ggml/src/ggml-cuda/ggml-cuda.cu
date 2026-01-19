@@ -4142,6 +4142,20 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     }
 }
 
+// TCQ4 channel permutation registration (RRS paper Section 3.2)
+// These functions wrap the RRS permutation registry defined in rrs.cu
+
+void ggml_backend_cuda_tcq4_register_perm(const char * tensor_name, const int32_t * perm, int K) {
+    ggml_cuda_rrs_register_perm(tensor_name, perm, K);
+}
+
+void ggml_backend_cuda_tcq4_clear_perms(void) {
+    ggml_cuda_rrs_clear_perms();
+}
+
+void ggml_backend_cuda_tcq4_set_reorder_enabled(bool enabled) {
+    ggml_cuda_rrs_set_reorder_enabled(enabled);
+}
 
 // backend device
 
@@ -4858,6 +4872,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // TCQ4 channel permutation registration (RRS paper Section 3.2)
+    if (strcmp(name, "ggml_backend_cuda_tcq4_register_perm") == 0) {
+        return (void *)ggml_backend_cuda_tcq4_register_perm;
+    }
+    if (strcmp(name, "ggml_backend_cuda_tcq4_clear_perms") == 0) {
+        return (void *)ggml_backend_cuda_tcq4_clear_perms;
+    }
+    if (strcmp(name, "ggml_backend_cuda_tcq4_set_reorder_enabled") == 0) {
+        return (void *)ggml_backend_cuda_tcq4_set_reorder_enabled;
     }
     return nullptr;
 }

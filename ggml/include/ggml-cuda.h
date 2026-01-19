@@ -40,6 +40,15 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// TCQ4 channel permutation registration (RRS paper Section 3.2)
+// Registers a channel permutation for a tensor, copying it to device memory
+// tensor_name: name of the weight tensor (e.g., "blk.0.attn_q.weight")
+// perm: host pointer to permutation indices [K]
+// K: number of channels (input dimension)
+GGML_BACKEND_API void ggml_backend_cuda_tcq4_register_perm(const char * tensor_name, const int32_t * perm, int K);
+GGML_BACKEND_API void ggml_backend_cuda_tcq4_clear_perms(void);
+GGML_BACKEND_API void ggml_backend_cuda_tcq4_set_reorder_enabled(bool enabled);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

@@ -439,6 +439,12 @@ struct llama_model::impl {
 
     std::string desc_str;
 
+    // TCQ4 channel permutations (RRS paper Section 3.2)
+    // Key: tensor name (e.g., "blk.0.attn_q.weight")
+    // Value: permutation indices [K] where K is input dimension
+    std::unordered_map<std::string, std::vector<int32_t>> tcq4_perms;
+    bool tcq4_reorder_enabled = false;
+
     // model memory mapped files
     llama_mmaps mappings;
 
@@ -7120,7 +7126,102 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Load TCQ4 channel permutations from GGUF metadata (RRS paper Section 3.2)
+    // Look for keys matching "tcq4.*.perm" pattern
+    {
+        const gguf_context * ctx = ml.meta.get();
+        const int64_t n_kv = gguf_get_n_kv(ctx);
+        
+        // Check if reordering is enabled
+        const int64_t reorder_key = gguf_find_key(ctx, "tcq4.reorder.enabled");
+        if (reorder_key >= 0) {
+            pimpl->tcq4_reorder_enabled = gguf_get_val_bool(ctx, reorder_key);
+            LLAMA_LOG_INFO("%s: TCQ4 channel reordering %s\n", __func__, 
+                          pimpl->tcq4_reorder_enabled ? "enabled" : "disabled");
+        }
+        
+        // Load permutations for each tensor
+        for (int64_t i = 0; i < n_kv; i++) {
+            const char * key = gguf_get_key(ctx, i);
+            
+            // Check if key matches "tcq4.*.perm" pattern
+            if (strncmp(key, "tcq4.", 5) == 0 && strlen(key) > 10) {
+                const char * suffix = strrchr(key, '.');
+                if (suffix && strcmp(suffix, ".perm") == 0) {
+                    // Extract tensor name from key: "tcq4.{tensor_name}.perm"
+                    std::string tensor_name(key + 5, suffix - key - 5);
+                    
+                    // Get array data
+                    if (gguf_get_kv_type(ctx, i) == GGUF_TYPE_ARRAY &&
+                        gguf_get_arr_type(ctx, i) == GGUF_TYPE_INT32) {
+                        const size_t n = gguf_get_arr_n(ctx, i);
+                        const int32_t * data = (const int32_t *)gguf_get_arr_data(ctx, i);
+                        
+                        std::vector<int32_t> perm(data, data + n);
+                        pimpl->tcq4_perms[tensor_name] = std::move(perm);
+                        
+                        LLAMA_LOG_INFO("%s: loaded TCQ4 permutation for %s (K=%zu)\n", 
+                                      __func__, tensor_name.c_str(), n);
+                    }
+                }
+            }
+        }
+        
+        if (!pimpl->tcq4_perms.empty()) {
+            LLAMA_LOG_INFO("%s: loaded %zu TCQ4 channel permutations\n", 
+                          __func__, pimpl->tcq4_perms.size());
+            
+            // Register permutations with GPU backend if available
+            // Look for CUDA/GPU device and get the registration function
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    
+                    // Get TCQ4 registration functions via proc_address
+                    typedef void (*tcq4_register_perm_fn)(const char*, const int32_t*, int);
+                    typedef void (*tcq4_set_reorder_fn)(bool);
+                    
+                    auto register_perm = (tcq4_register_perm_fn)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tcq4_register_perm");
+                    auto set_reorder = (tcq4_set_reorder_fn)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_tcq4_set_reorder_enabled");
+                    
+                    if (register_perm && set_reorder) {
+                        // Enable reordering
+                        set_reorder(pimpl->tcq4_reorder_enabled);
+                        
+                        // Register each permutation
+                        for (const auto & [tensor_name, perm] : pimpl->tcq4_perms) {
+                            register_perm(tensor_name.c_str(), perm.data(), (int)perm.size());
+                        }
+                        LLAMA_LOG_INFO("%s: registered %zu TCQ4 permutations with GPU backend\n",
+                                      __func__, pimpl->tcq4_perms.size());
+                        break; // Only register with first GPU backend
+                    }
+                }
+            }
+        }
+    }
+
     return true;
+}
+
+// Get TCQ4 channel permutation for a tensor (returns nullptr if not found)
+const std::vector<int32_t> * llama_model::get_tcq4_perm(const char * tensor_name) const {
+    if (!pimpl->tcq4_reorder_enabled) {
+        return nullptr;
+    }
+    auto it = pimpl->tcq4_perms.find(tensor_name);
+    if (it != pimpl->tcq4_perms.end()) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
+// Check if TCQ4 channel reordering is enabled for this model
+bool llama_model::tcq4_reorder_enabled() const {
+    return pimpl->tcq4_reorder_enabled;
 }
 
 std::string llama_model::arch_name() const {

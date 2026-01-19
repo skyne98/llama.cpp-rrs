@@ -525,6 +525,10 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
+    // TCQ4 channel reordering (RRS paper Section 3.2)
+    const std::vector<int32_t> * get_tcq4_perm(const char * tensor_name) const;
+    bool tcq4_reorder_enabled() const;
+
     // TODO: move this to new llm_arch_model_i interface
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
