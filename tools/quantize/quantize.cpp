@@ -121,119 +121,42 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
     return false;
 }
 
-// Load TCQ4 channel permutations from JSON file
-// Returns true on success, false on failure
-static bool load_tcq4_perms(const std::string & filename, std::unordered_map<std::string, std::vector<int32_t>> & perms) {
-    std::ifstream f(filename);
-    if (!f.is_open()) {
-        fprintf(stderr, "%s: failed to open TCQ4 perms file '%s'\n", __func__, filename.c_str());
-        return false;
-    }
-
-    std::stringstream buffer;
-    buffer << f.rdbuf();
-    std::string json = buffer.str();
-
-    // Very simple JSON parser for our specific format
-    // Find "permutations" object
-    size_t perm_pos = json.find("\"permutations\"");
-    if (perm_pos == std::string::npos) {
-        fprintf(stderr, "%s: no 'permutations' key found in JSON\n", __func__);
-        return false;
-    }
-
-    // Find the opening brace of permutations object
-    size_t obj_start = json.find('{', perm_pos);
-    if (obj_start == std::string::npos) {
-        fprintf(stderr, "%s: malformed JSON - no permutations object\n", __func__);
-        return false;
-    }
-
-    // Parse each tensor's permutation array
-    size_t pos = obj_start + 1;
-    int brace_depth = 1;
+// Derive TCQ4 channel permutations from imatrix data (RRS paper Section 3.2)
+// Sorts channels by activation magnitude (sum of squared activations) descending
+// This puts outlier channels first, which improves FWHT smoothing
+static void derive_tcq4_perms_from_imatrix(
+        const std::unordered_map<std::string, std::vector<float>> & imatrix_data,
+        std::unordered_map<std::string, std::vector<int32_t>> & perms) {
     
-    while (pos < json.size() && brace_depth > 0) {
-        // Skip whitespace
-        while (pos < json.size() && std::isspace(json[pos])) pos++;
+    for (const auto & kv : imatrix_data) {
+        const std::string & name = kv.first;
+        const std::vector<float> & values = kv.second;
         
-        if (json[pos] == '}') {
-            brace_depth--;
-            pos++;
-            continue;
+        if (values.empty()) continue;
+        
+        const int64_t K = (int64_t)values.size();
+        
+        // Create index array
+        std::vector<int32_t> perm(K);
+        for (int32_t i = 0; i < K; ++i) {
+            perm[i] = i;
         }
         
-        if (json[pos] == ',') {
-            pos++;
-            continue;
-        }
-
-        // Expect a string key (tensor name)
-        if (json[pos] != '"') {
-            pos++;
-            continue;
-        }
+        // Sort by imatrix value descending (high activation magnitude = outliers first)
+        std::sort(perm.begin(), perm.end(), [&values](int32_t a, int32_t b) {
+            return values[a] > values[b];
+        });
         
-        // Parse tensor name
-        size_t name_start = pos + 1;
-        size_t name_end = json.find('"', name_start);
-        if (name_end == std::string::npos) break;
-        
-        std::string tensor_name = json.substr(name_start, name_end - name_start);
-        pos = name_end + 1;
-        
-        // Skip to colon
-        while (pos < json.size() && json[pos] != ':') pos++;
-        if (pos >= json.size()) break;
-        pos++; // skip colon
-        
-        // Skip whitespace
-        while (pos < json.size() && std::isspace(json[pos])) pos++;
-        
-        // Expect array
-        if (json[pos] != '[') {
-            fprintf(stderr, "%s: expected array for tensor '%s'\n", __func__, tensor_name.c_str());
-            continue;
-        }
-        pos++; // skip '['
-        
-        // Parse array of integers
-        std::vector<int32_t> perm;
-        while (pos < json.size() && json[pos] != ']') {
-            // Skip whitespace and commas
-            while (pos < json.size() && (std::isspace(json[pos]) || json[pos] == ',')) pos++;
-            if (json[pos] == ']') break;
-            
-            // Parse integer
-            int32_t val = 0;
-            bool negative = false;
-            if (json[pos] == '-') {
-                negative = true;
-                pos++;
-            }
-            while (pos < json.size() && std::isdigit(json[pos])) {
-                val = val * 10 + (json[pos] - '0');
-                pos++;
-            }
-            if (negative) val = -val;
-            perm.push_back(val);
-        }
-        
-        if (json[pos] == ']') pos++; // skip ']'
-        
-        if (!perm.empty()) {
-            perms[tensor_name] = std::move(perm);
-        }
+        perms[name] = std::move(perm);
     }
-
-    fprintf(stderr, "%s: loaded %zu tensor permutations from '%s'\n", __func__, perms.size(), filename.c_str());
-    return true;
+    
+    printf("%s: derived %zu channel permutations from imatrix data\n", __func__, perms.size());
 }
 
 [[noreturn]]
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
-    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--prune-layers] [--keep-split] [--override-kv] [--tcq4-perms]\n");
+    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--prune-layers] [--keep-split] [--override-kv] [--tcq4-imatrix]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
@@ -250,9 +173,8 @@ static void usage(const char * executable) {
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n");
-    printf("  --tcq4-perms file_name: use channel permutations from JSON file for TCQ4_K32 quantization (RRS paper Section 3.2)\n");
-    printf("      The JSON file should have format: {\"reorder_enabled\": true, \"permutations\": {\"tensor_name\": [0, 1, 2, ...], ...}}\n");
-    printf("      Generate with: python tools/tcq4-calibrate/calibrate.py --model model.gguf --output perms.json\n");
+    printf("  --tcq4-imatrix: derive TCQ4 channel permutations from --imatrix data (RRS paper Section 3.2)\n");
+    printf("      Sorts channels by activation magnitude for better FWHT smoothing. Requires --imatrix.\n");
     printf("Note: --include-weights and --exclude-weights cannot be used together\n");
     printf("\nAllowed quantization types:\n");
     for (const auto & it : QUANT_OPTIONS) {
@@ -567,7 +489,7 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
-    std::string tcq4_perms_file;
+    bool tcq4_use_imatrix = false;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_quantization> tensor_types;
@@ -631,12 +553,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
-        } else if (strcmp(argv[arg_idx], "--tcq4-perms") == 0) {
-            if (arg_idx < argc-1) {
-                tcq4_perms_file = argv[++arg_idx];
-            } else {
-                usage(argv[0]);
-            }
+        } else if (strcmp(argv[arg_idx], "--tcq4-imatrix") == 0) {
+            tcq4_use_imatrix = true;
         } else {
             usage(argv[0]);
         }
@@ -682,12 +600,13 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Load TCQ4 channel permutations if provided
-    if (!tcq4_perms_file.empty()) {
-        if (!load_tcq4_perms(tcq4_perms_file, tcq4_perms_data)) {
-            fprintf(stderr, "%s: failed to load TCQ4 permutations from '%s'\n", __func__, tcq4_perms_file.c_str());
+    // Derive TCQ4 channel permutations from imatrix if requested
+    if (tcq4_use_imatrix) {
+        if (imatrix_data.empty()) {
+            fprintf(stderr, "%s: --tcq4-imatrix requires --imatrix\n", __func__);
             return 1;
         }
+        derive_tcq4_perms_from_imatrix(imatrix_data, tcq4_perms_data);
         params.tcq4_perms = &tcq4_perms_data;
         
         // Add GGUF metadata to enable reordering at runtime

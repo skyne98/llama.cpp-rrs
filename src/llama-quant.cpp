@@ -837,6 +837,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         ::zeros(fout, meta_size);
     };
 
+    // Write TCQ4 channel permutations to GGUF metadata BEFORE opening output file
+    // (must be done before new_ofstream() calculates metadata size)
+    if (params->tcq4_perms && default_type == GGML_TYPE_TCQ4_K32) {
+        const auto * tcq4_perms = static_cast<const std::unordered_map<std::string, std::vector<int32_t>> *>(params->tcq4_perms);
+        
+        if (!tcq4_perms->empty()) {
+            // Set global reorder enabled flag
+            gguf_set_val_bool(ctx_outs[0].get(), TCQ4_REORDER_ENABLED_KEY, true);
+            
+            // Write each permutation array
+            for (const auto & [tensor_name, perm] : *tcq4_perms) {
+                std::string perm_key = std::string(TCQ4_PERM_KEY_PREFIX) + tensor_name + TCQ4_PERM_KEY_SUFFIX;
+                gguf_set_arr_data(ctx_outs[0].get(), perm_key.c_str(), GGUF_TYPE_INT32, perm.data(), perm.size());
+            }
+            LLAMA_LOG_INFO("%s: adding %zu TCQ4 channel permutations to GGUF\n", __func__, tcq4_perms->size());
+        }
+    }
+
     const auto tn = LLM_TN(model.arch);
     new_ofstream(0);
     for (const auto * it : tensors) {
@@ -1109,24 +1127,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         zeros(fout, GGML_PAD(new_size, align) - new_size);
     }
     close_ofstream();
-
-    // Write TCQ4 channel permutations to GGUF metadata (for runtime reordering)
-    if (params->tcq4_perms && default_type == GGML_TYPE_TCQ4_K32) {
-        const auto * tcq4_perms = static_cast<const std::unordered_map<std::string, std::vector<int32_t>> *>(params->tcq4_perms);
-        
-        if (!tcq4_perms->empty()) {
-            LLAMA_LOG_INFO("%s: writing %zu TCQ4 channel permutations to GGUF\n", __func__, tcq4_perms->size());
-            
-            // Set global reorder enabled flag
-            gguf_set_val_bool(ctx_outs[0].get(), TCQ4_REORDER_ENABLED_KEY, true);
-            
-            // Write each permutation array
-            for (const auto & [tensor_name, perm] : *tcq4_perms) {
-                std::string perm_key = std::string(TCQ4_PERM_KEY_PREFIX) + tensor_name + TCQ4_PERM_KEY_SUFFIX;
-                gguf_set_arr_data(ctx_outs[0].get(), perm_key.c_str(), GGUF_TYPE_INT32, perm.data(), perm.size());
-            }
-        }
-    }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB\n", __func__, total_size_org/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB\n", __func__, total_size_new/1024.0/1024.0);
