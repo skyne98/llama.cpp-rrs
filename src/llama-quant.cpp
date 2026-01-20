@@ -277,6 +277,12 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0) {
                 new_type = GGML_TYPE_Q4_K;
             }
+            // TCQ4 tile format uses FWHT which doesn't work well for embeddings
+            // (get_rows applies inverse FWHT but the graph output type is F32, causing issues)
+            // Use Q4_K for embeddings instead
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TCQ4_K32) {
+                new_type = GGML_TYPE_Q4_K;
+            }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
                ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
@@ -461,15 +467,31 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
     //}
     bool convert_incompatible_tensor = false;
     {
-        const int64_t nx = tensor->ne[0];
-        const int64_t ny = tensor->ne[1];
-        const int64_t qk_k = ggml_blck_size(new_type);
+        const int64_t nx = tensor->ne[0];  // K dimension (columns)
+        const int64_t ny = tensor->ne[1];  // N dimension (rows/output channels)
 
-        if (nx % qk_k != 0) {
-            LLAMA_LOG_WARN("\n\n%s : tensor cols %" PRId64 " x %" PRId64 " are not divisible by %" PRId64 ", required for %s", __func__, nx, ny, qk_k, ggml_type_name(new_type));
-            convert_incompatible_tensor = true;
+        // TCQ4 tile format has special constraints:
+        // - K (columns) must be divisible by 256 (TCQ4_TILE_K)
+        // - N (rows) must be divisible by 8 (TCQ4_TILE_CHANNELS)
+        // Note: blck_size is 2048 (8*256) but that's for storage, not the K constraint
+        if (new_type == GGML_TYPE_TCQ4_K32) {
+            if (nx % 256 != 0) {
+                LLAMA_LOG_WARN("\n\n%s : tensor cols %" PRId64 " x %" PRId64 " not divisible by 256, required for %s", __func__, nx, ny, ggml_type_name(new_type));
+                convert_incompatible_tensor = true;
+            } else if (ny % 8 != 0) {
+                LLAMA_LOG_WARN("\n\n%s : tensor rows %" PRId64 " not divisible by 8, required for %s tile format", __func__, ny, ggml_type_name(new_type));
+                convert_incompatible_tensor = true;
+            } else {
+                ++qs.n_k_quantized;
+            }
         } else {
-            ++qs.n_k_quantized;
+            const int64_t qk_k = ggml_blck_size(new_type);
+            if (nx % qk_k != 0) {
+                LLAMA_LOG_WARN("\n\n%s : tensor cols %" PRId64 " x %" PRId64 " are not divisible by %" PRId64 ", required for %s", __func__, nx, ny, qk_k, ggml_type_name(new_type));
+                convert_incompatible_tensor = true;
+            } else {
+                ++qs.n_k_quantized;
+            }
         }
     }
 
@@ -490,6 +512,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             case GGML_TYPE_Q4_K:   new_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:   new_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_TCQ4_K32: new_type = GGML_TYPE_Q4_K; break;  // Fallback for tensors not divisible by tile size (2048)
+            case GGML_TYPE_Q4_K_RRS: new_type = GGML_TYPE_Q4_K; break;  // Fallback for RRS format
             default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
         }
         if (tensor->ne[0] % ggml_blck_size(new_type) != 0) {
@@ -1000,7 +1024,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             const int64_t nrows = tensor->ne[1];
 
             static const int64_t min_chunk_size = 32 * 512;
-            const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+            int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
+            
+            // TCQ4 tile format requires processing rows in groups of 8
+            // Ensure chunk_size gives nrows_per_chunk that's a multiple of 8
+            if (new_type == GGML_TYPE_TCQ4_K32) {
+                int64_t nrows_per_chunk = chunk_size / n_per_row;
+                if (nrows_per_chunk % 8 != 0) {
+                    // Round up to next multiple of 8 rows
+                    nrows_per_chunk = ((nrows_per_chunk + 7) / 8) * 8;
+                    chunk_size = nrows_per_chunk * n_per_row;
+                }
+            }
 
             const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
             const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;

@@ -1353,119 +1353,288 @@ void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_REST
     }
 }
 
-// TCQ4-K32: Tensor Core native INT4 dequantization
-void dequantize_row_tcq4_k32(const block_tcq4_k32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    assert(k % TCQ4_K32_BLOCK_SIZE == 0);
-    const int64_t nb = k / TCQ4_K32_BLOCK_SIZE;
+// =============================================================================
+// TCQ4 Tile Format: 8 channels × 256 K elements in IMMA-native layout
+// Matches validated TCQ4Tile from rrs_validation/reference.py
+// =============================================================================
 
-    for (int64_t i = 0; i < nb; i++) {
-        const float S = GGML_FP16_TO_FP32(x[i].S);
-        const float Z = GGML_FP16_TO_FP32(x[i].Z);
+// Helper: Pack 8 INT4 values into uint32 (IMMA format)
+// Element 0 in bits 3:0, Element 7 in bits 31:28
+static inline uint32_t tcq4_pack_int4x8(const int8_t * vals) {
+    uint32_t result = 0;
+    for (int i = 0; i < 8; i++) {
+        result |= ((uint32_t)(vals[i] & 0xF)) << (i * 4);
+    }
+    return result;
+}
 
-        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
-            const float scale = S * (float)x[i].sc[g];
-            const float zero = Z * (float)x[i].zc[g];
+// Helper: Unpack uint32 to 8 signed INT4 values
+static inline void tcq4_unpack_int4x8(uint32_t packed, int8_t * vals) {
+    for (int i = 0; i < 8; i++) {
+        int v = (packed >> (i * 4)) & 0xF;
+        vals[i] = (v >= 8) ? (int8_t)(v - 16) : (int8_t)v;
+    }
+}
 
-            for (int j = 0; j < TCQ4_K32_GROUP_SIZE; j += 2) {
-                const int idx = g * TCQ4_K32_GROUP_SIZE + j;
-                const uint8_t byte = x[i].qs[idx / 2];
+// Pack 8 channels × 32 K elements into IMMA B fragment order (128 bytes)
+// weights_8chan[channel][k] -> packed[128] in IMMA lane order
+static void tcq4_pack_imma_tile(const int8_t weights_8chan[8][32], uint8_t packed[128]) {
+    // IMMA B fragment: lane L gets column L//4, rows [(L%4)*8 : +8]
+    // We pack so lane L reads bytes [L*4 : L*4+4] as uint32
+    for (int lane = 0; lane < 32; lane++) {
+        int channel = lane / 4;   // 0-7, which output channel
+        int k_slice = lane % 4;   // 0-3, which 8-element slice of K
+        int k_start = k_slice * 8;
 
-                int8_t v0 = (int8_t)(byte & 0x0F);
-                v0 = (v0 >= 8) ? (v0 - 16) : v0;
-                int8_t v1 = (int8_t)((byte >> 4) & 0x0F);
-                v1 = (v1 >= 8) ? (v1 - 16) : v1;
+        // Get 8 INT4 values for this lane
+        int8_t vals[8];
+        for (int i = 0; i < 8; i++) {
+            vals[i] = weights_8chan[channel][k_start + i];
+        }
 
-                y[i * TCQ4_K32_BLOCK_SIZE + idx] = scale * (float)v0 + zero;
-                y[i * TCQ4_K32_BLOCK_SIZE + idx + 1] = scale * (float)v1 + zero;
+        // Pack into uint32 and store at lane's position
+        uint32_t reg = tcq4_pack_int4x8(vals);
+        int byte_offset = lane * 4;
+        memcpy(&packed[byte_offset], &reg, sizeof(uint32_t));
+    }
+}
+
+// Unpack IMMA B fragment (128 bytes) back to 8 channels × 32 K elements
+static void tcq4_unpack_imma_tile(const uint8_t packed[128], int8_t weights_8chan[8][32]) {
+    for (int lane = 0; lane < 32; lane++) {
+        int channel = lane / 4;
+        int k_slice = lane % 4;
+        int k_start = k_slice * 8;
+
+        // Load uint32 from lane's position
+        uint32_t reg;
+        memcpy(&reg, &packed[lane * 4], sizeof(uint32_t));
+
+        // Unpack 8 INT4 values
+        int8_t vals[8];
+        tcq4_unpack_int4x8(reg, vals);
+        for (int i = 0; i < 8; i++) {
+            weights_8chan[channel][k_start + i] = vals[i];
+        }
+    }
+}
+
+// TCQ4 Tile: Dequantize one tile (8 channels × 256 K) to float
+// Output: y[channel * K + k] for channel in [0,8), k in [0,256)
+// Note: This dequantizes to interleaved format for compatibility with ggml row assumptions
+void dequantize_row_tcq4_tile(const block_tcq4_tile * GGML_RESTRICT tile, float * GGML_RESTRICT y, int64_t k) {
+    // k here is actually the total number of elements to dequantize
+    // For tile format: one tile = 2048 weights (8 channels × 256 K)
+    // But ggml expects per-row dequantization, so we handle it specially
+    
+    // This function is called per-row, but tiles contain 8 rows
+    // For now, implement as if called with k = 256 (one channel's worth)
+    // The caller must handle the tile-to-row mapping
+    
+    assert(k % TCQ4_TILE_K == 0);
+    const int64_t num_k_tiles = k / TCQ4_TILE_K;
+    
+    for (int64_t t = 0; t < num_k_tiles; t++) {
+        const block_tcq4_tile * tp = &tile[t];
+        
+        // Dequantize all 8 channels × 256 K elements
+        for (int c = 0; c < TCQ4_TILE_CHANNELS; c++) {
+            const float S = GGML_FP16_TO_FP32(tp->S[c]);
+            const float Z = GGML_FP16_TO_FP32(tp->Z[c]);
+            
+            for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+                const float scale = S * (float)tp->sc[c][g] / 127.0f;
+                const float zero = Z * (float)tp->zc[c][g] / 127.0f;
+                
+                // Unpack this K-group from IMMA format
+                int8_t group_weights[8][32];
+                tcq4_unpack_imma_tile(tp->tiles[g], group_weights);
+                
+                // Dequantize this channel's portion
+                for (int j = 0; j < TCQ4_TILE_GROUP_SIZE; j++) {
+                    int k_idx = g * TCQ4_TILE_GROUP_SIZE + j;
+                    float val = scale * (float)group_weights[c][j] + zero;
+                    // Output in channel-major order: y[c * 256 + k]
+                    y[t * TCQ4_TILE_WEIGHTS + c * TCQ4_TILE_K + k_idx] = val;
+                }
             }
         }
     }
 }
 
-// TCQ4-K32: Quantization reference implementation
-void quantize_row_tcq4_k32_ref(const float * GGML_RESTRICT x, block_tcq4_k32 * GGML_RESTRICT y, int64_t k) {
-    assert(k % TCQ4_K32_BLOCK_SIZE == 0);
-    const int64_t nb = k / TCQ4_K32_BLOCK_SIZE;
-
-    for (int64_t i = 0; i < nb; i++) {
-        const float * xb = x + i * TCQ4_K32_BLOCK_SIZE;
-
-        // Find per-group scales (symmetric quantization)
-        float scales[TCQ4_K32_NUM_GROUPS];
-        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
+// TCQ4 Tile: Quantize reference (single row - NOT tile-aware)
+// This is a fallback that quantizes one row treating it as 8 dummy channels
+// Real quantization should use quantize_tcq4_tile which processes 8 rows at once
+void quantize_row_tcq4_tile_ref(const float * GGML_RESTRICT x, block_tcq4_tile * GGML_RESTRICT y, int64_t k) {
+    // This ref function handles the case where we only have 1 row but need tile format
+    // We replicate the row across all 8 channels (not ideal but maintains API compatibility)
+    assert(k % TCQ4_TILE_K == 0);
+    const int64_t num_k_tiles = k / TCQ4_TILE_K;
+    
+    for (int64_t t = 0; t < num_k_tiles; t++) {
+        const float * xb = x + t * TCQ4_TILE_K;
+        block_tcq4_tile * tile = &y[t];
+        
+        // For single-row ref, we only populate channel 0, zero others
+        // Compute per-group scales for this one channel
+        float scales[TCQ4_TILE_GROUPS];
+        for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
             float max_abs = 0.0f;
-            for (int j = 0; j < TCQ4_K32_GROUP_SIZE; j++) {
-                float v = fabsf(xb[g * TCQ4_K32_GROUP_SIZE + j]);
+            for (int j = 0; j < TCQ4_TILE_GROUP_SIZE; j++) {
+                float v = fabsf(xb[g * TCQ4_TILE_GROUP_SIZE + j]);
                 if (v > max_abs) max_abs = v;
             }
-            scales[g] = max_abs / 7.0f;  // INT4 range: [-8, 7]
+            scales[g] = max_abs / 7.0f;
             if (scales[g] < 1e-10f) scales[g] = 1.0f;
         }
-
-        // Find scale-of-scales
+        
+        // Find super-scale
         float max_scale = 0.0f;
-        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
+        for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
             if (scales[g] > max_scale) max_scale = scales[g];
         }
         float S_f = (max_scale > 0.0f) ? (max_scale / 127.0f) : 1.0f;
-
-        y[i].S = GGML_FP32_TO_FP16(S_f);
-        y[i].Z = GGML_FP32_TO_FP16(0.0f);  // Symmetric quantization
-
-        // Quantize scales and values
-        for (int g = 0; g < TCQ4_K32_NUM_GROUPS; g++) {
-            y[i].sc[g] = (int8_t)roundf(scales[g] / S_f);
-            y[i].zc[g] = 0;
-
-            float inv_scale = 1.0f / scales[g];
-
-            for (int j = 0; j < TCQ4_K32_GROUP_SIZE; j += 2) {
-                float v0 = xb[g * TCQ4_K32_GROUP_SIZE + j];
-                float v1 = xb[g * TCQ4_K32_GROUP_SIZE + j + 1];
-
-                int8_t q0 = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(v0 * inv_scale)));
-                int8_t q1 = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(v1 * inv_scale)));
-
-                y[i].qs[(g * TCQ4_K32_GROUP_SIZE + j) / 2] = ((uint8_t)(q1 & 0x0F) << 4) | ((uint8_t)(q0 & 0x0F));
+        
+        // Initialize all channels
+        for (int c = 0; c < TCQ4_TILE_CHANNELS; c++) {
+            tile->S[c] = GGML_FP32_TO_FP16(c == 0 ? S_f : 1.0f);
+            tile->Z[c] = GGML_FP32_TO_FP16(0.0f);
+            for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+                tile->sc[c][g] = (c == 0) ? (int8_t)roundf(scales[g] / S_f) : 0;
+                tile->zc[c][g] = 0;
             }
+        }
+        
+        // Quantize and pack into IMMA format
+        for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+            int8_t group_weights[8][32];
+            memset(group_weights, 0, sizeof(group_weights));
+            
+            // Only channel 0 has real data
+            float inv_scale = 1.0f / scales[g];
+            for (int j = 0; j < TCQ4_TILE_GROUP_SIZE; j++) {
+                float v = xb[g * TCQ4_TILE_GROUP_SIZE + j];
+                group_weights[0][j] = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(v * inv_scale)));
+            }
+            
+            tcq4_pack_imma_tile(group_weights, tile->tiles[g]);
         }
     }
 }
 
-// TCQ4-K32: Quantization with FWHT (like Q4_K_RRS)
-// For RRS W4A4, weights must be FWHT'd before symmetric quantization
-size_t quantize_tcq4_k32(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);  // TODO: use importance matrix
-    size_t row_size = ggml_row_size(GGML_TYPE_TCQ4_K32, n_per_row);
+// TCQ4 Tile: Main quantization function (processes 8 rows at a time)
+// For RRS W4A4, weights are FWHT'd before quantization
+// Handles partial row groups (nrow % 8 != 0) by zero-padding internally
+size_t quantize_tcq4_tile(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
     
-    // Allocate scratch buffer for FWHT
-    float * scratch = (float *)malloc(n_per_row * sizeof(float));
+    // Tile format requires: K % 256 == 0
+    assert(n_per_row % TCQ4_TILE_K == 0);
+    
+    const int64_t num_k_tiles = n_per_row / TCQ4_TILE_K;
+    
+    // Calculate how many complete 8-row groups and any remainder
+    const int64_t num_full_groups = nrow / 8;
+    const int64_t remainder_rows = nrow % 8;
+    const int64_t num_row_groups = num_full_groups + (remainder_rows > 0 ? 1 : 0);
+    
+    // Allocate scratch for FWHT (8 rows at once)
+    float * scratch = (float *)malloc(8 * n_per_row * sizeof(float));
     if (!scratch) {
-        // Fallback: quantize without FWHT (will produce worse results)
-        for (int64_t row = 0; row < nrow; ++row) {
-            quantize_row_tcq4_k32_ref(src + row * n_per_row, (block_tcq4_k32 *)((char *)dst + row * row_size), n_per_row);
-        }
-        return nrow * row_size;
+        fprintf(stderr, "quantize_tcq4_tile: failed to allocate scratch buffer\n");
+        return 0;
     }
     
-    // TCQ4_K32 uses 256-element blocks, so FWHT must be applied in 256-element chunks
-    // This matches the CUDA kernel's fwht_256_shared() which does FWHT per block
-    const int step = TCQ4_K32_BLOCK_SIZE;  // Always 256, matching CUDA kernel
+    // Process 8 rows at a time (with zero-padding for partial groups)
+    int64_t row = 0;
+    block_tcq4_tile * tiles_out = (block_tcq4_tile *)dst;
+    int64_t tile_idx = 0;
     
-    for (int64_t row = 0; row < nrow; ++row) {
-        // Copy row to scratch
-        memcpy(scratch, src + row * n_per_row, n_per_row * sizeof(float));
+    for (int64_t rg = 0; rg < num_row_groups; rg++) {
+        // Determine how many actual rows in this group (8 or remainder for last group)
+        const int rows_in_group = (rg < num_full_groups) ? 8 : (int)remainder_rows;
         
-        // Apply FWHT in 256-element chunks (must match CUDA kernel)
-        for (int i = 0; i < n_per_row; i += step) {
-            ggml_fwht_impl(scratch + i, step);
+        // Copy rows to scratch, zero-pad if partial group
+        for (int c = 0; c < 8; c++) {
+            if (c < rows_in_group) {
+                memcpy(scratch + c * n_per_row, src + (row + c) * n_per_row, n_per_row * sizeof(float));
+                // Apply FWHT in 256-element chunks
+                for (int64_t i = 0; i < n_per_row; i += TCQ4_TILE_K) {
+                    ggml_fwht_impl(scratch + c * n_per_row + i, TCQ4_TILE_K);
+                }
+            } else {
+                // Zero-pad channels beyond actual row count
+                memset(scratch + c * n_per_row, 0, n_per_row * sizeof(float));
+            }
         }
         
-        // Quantize FWHT'd data
-        quantize_row_tcq4_k32_ref(scratch, (block_tcq4_k32 *)((char *)dst + row * row_size), n_per_row);
+        // Process each K-tile
+        for (int64_t kt = 0; kt < num_k_tiles; kt++) {
+            block_tcq4_tile * tile = &tiles_out[tile_idx++];
+            
+            // Compute per-channel per-group scales
+            float scales[8][8];  // [channel][group]
+            for (int c = 0; c < 8; c++) {
+                const float * row_data = scratch + c * n_per_row + kt * TCQ4_TILE_K;
+                for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+                    float max_abs = 0.0f;
+                    for (int j = 0; j < TCQ4_TILE_GROUP_SIZE; j++) {
+                        float v = fabsf(row_data[g * TCQ4_TILE_GROUP_SIZE + j]);
+                        if (v > max_abs) max_abs = v;
+                    }
+                    scales[c][g] = max_abs / 7.0f;
+                    if (scales[c][g] < 1e-10f) scales[c][g] = 1.0f;
+                }
+            }
+            
+            // Compute per-channel super-scales
+            // Dequant formula: scale = S * sc / 127
+            // So we store S = max_scale, sc = round(scales[c][g] / S * 127)
+            // This gives: scale = max_scale * (scales/max_scale*127) / 127 = scales
+            for (int c = 0; c < 8; c++) {
+                float max_scale = 0.0f;
+                for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+                    if (scales[c][g] > max_scale) max_scale = scales[c][g];
+                }
+                float S_f = (max_scale > 0.0f) ? max_scale : 1.0f;
+                
+                tile->S[c] = GGML_FP32_TO_FP16(S_f);
+                tile->Z[c] = GGML_FP32_TO_FP16(0.0f);  // Symmetric quantization
+                
+                for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+                    // sc = round(scales[c][g] / S * 127), clamped to int8 range
+                    float sc_f = (scales[c][g] / S_f) * 127.0f;
+                    tile->sc[c][g] = (int8_t)fmaxf(-127.0f, fminf(127.0f, roundf(sc_f)));
+                    tile->zc[c][g] = 0;
+                }
+            }
+            
+            // Quantize and pack each K-group into IMMA B fragment order
+            for (int g = 0; g < TCQ4_TILE_GROUPS; g++) {
+                int8_t group_weights[8][32];
+                
+                for (int c = 0; c < 8; c++) {
+                    const float * row_data = scratch + c * n_per_row + kt * TCQ4_TILE_K;
+                    float inv_scale = 1.0f / scales[c][g];
+                    
+                    for (int j = 0; j < TCQ4_TILE_GROUP_SIZE; j++) {
+                        float v = row_data[g * TCQ4_TILE_GROUP_SIZE + j];
+                        group_weights[c][j] = (int8_t)fmaxf(-8.0f, fminf(7.0f, roundf(v * inv_scale)));
+                    }
+                }
+                
+                tcq4_pack_imma_tile(group_weights, tile->tiles[g]);
+            }
+        }
+        
+        row += rows_in_group;
     }
     
     free(scratch);
+    
+    // Return bytes for the actual rows (not including padding)
+    // GGML expects nrow * row_size where row_size = (n_per_row/256) * 148
+    const size_t row_size = num_k_tiles * 148;
     return nrow * row_size;
 }
 
@@ -5361,14 +5530,25 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_TCQ4_K32:
             {
-                // TCQ4-K32: validate S and Z (fp16 scale-of-scales and scale-of-zeros)
-                const block_tcq4_k32 * q = (const block_tcq4_k32 *) data;
-                for (size_t i = 0; i < nb; ++i) {
-                    if (!validate_fp16(q[i].S, i)) {
-                        return false;
-                    }
-                    if (!validate_fp16(q[i].Z, i)) {
-                        return false;
+                // TCQ4 Tile format: tiles stored as [N/8][K/256], each 1184 bytes
+                // nb is calculated as (n_elements / blck_size) with blck_size=256
+                // But actual tiles are 1184 bytes covering 8 channels × 256 K
+                // Number of tiles = nb / 8 (since 8 channels share each tile)
+                // However, nb counts 256-element blocks per row, so for proper validation
+                // we need to iterate over actual tiles in memory
+                const uint8_t * data_bytes = (const uint8_t *) data;
+                size_t total_bytes = nb * 148;  // type_size=148 per 256-block
+                size_t num_tiles = total_bytes / sizeof(block_tcq4_tile);
+                
+                for (size_t i = 0; i < num_tiles; ++i) {
+                    const block_tcq4_tile * tile = (const block_tcq4_tile *)(data_bytes + i * sizeof(block_tcq4_tile));
+                    for (int c = 0; c < TCQ4_TILE_CHANNELS; c++) {
+                        if (!validate_fp16(tile->S[c], i)) {
+                            return false;
+                        }
+                        if (!validate_fp16(tile->Z[c], i)) {
+                            return false;
+                        }
                     }
                 }
             } break;

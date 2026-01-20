@@ -94,14 +94,20 @@ static __global__ void k_get_rows_back_float(
 }
 
 // Special kernel for TCQ4_K32 get_rows (dequantize to float)
+// NEW: Tile format - 8 channels per tile, IMMA-packed B fragments
+// Each row is spread across tiles: row i uses channel (i % 8) from tile (i / 8)
 template<typename dst_t>
-static __global__ void k_get_rows_tcq4_k32(
+static __global__ void k_get_rows_tcq4_tile(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, 
+        const int64_t ne00,  // K dimension (elements per row)
         const int64_t ne11, const int64_t ne12, 
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12) {
+
+    // Tile format: each tile has 8 channels × 256 K elements
+    // Tiles are stored as [n_tile][k_tile] where n_tile = row / 8
+    const int64_t num_k_tiles = ne00 / TCQ4_TILE_K;
 
     for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
         for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
@@ -112,28 +118,46 @@ static __global__ void k_get_rows_tcq4_k32(
             const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
             dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
-            // TCQ4_K32 uses 256-element blocks
-            const block_tcq4_k32 * src0_row = (const block_tcq4_k32 *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
-
-            const int ib = i00 / TCQ4_K32_BLOCK_SIZE;  // block index
-            const int iq = i00 % TCQ4_K32_BLOCK_SIZE;  // element within block
             
-            const block_tcq4_k32 * b = src0_row + ib;
+            // Tile-based indexing: row i01 uses channel (i01 % 8) from tile group (i01 / 8)
+            const int n_tile = i01 / 8;
+            const int channel = i01 % 8;
             
-            const float S = __half2float(b->S);
-            const float Z = __half2float(b->Z);
+            // K-tile index for this element
+            const int kt = i00 / TCQ4_TILE_K;
+            const int k_in_tile = i00 % TCQ4_TILE_K;
             
-            // 8 groups of 32 elements
-            const int group = iq / TCQ4_K32_GROUP_SIZE;
-            const float scale = S * (float)b->sc[group];
-            const float zero = Z * (float)b->zc[group];
+            // Get pointer to the tile
+            // nb01 is bytes per row in the original layout
+            // For tile format: tiles are [n_tile][k_tile], total_n_tiles = (total_rows + 7) / 8
+            const block_tcq4_tile * tiles = (const block_tcq4_tile *)((const char *)src0 + i11*nb02 + i12*nb03);
+            const block_tcq4_tile * tile = &tiles[n_tile * num_k_tiles + kt];
             
-            // Unpack INT4 (2 values per byte)
-            const int byte_idx = iq / 2;
-            const uint8_t packed = b->qs[byte_idx];
+            // Get scales for this channel
+            const float S = __half2float(tile->S[channel]);
+            const float Z = __half2float(tile->Z[channel]);
+            
+            // K-group within the 256-element K-tile (8 groups of 32)
+            const int group = k_in_tile / TCQ4_TILE_GROUP_SIZE;
+            const int k_in_group = k_in_tile % TCQ4_TILE_GROUP_SIZE;
+            
+            const float scale = S * (float)tile->sc[channel][group] / 127.0f;
+            const float zero = Z * (float)tile->zc[channel][group] / 127.0f;
+            
+            // Unpack INT4 from IMMA B fragment format
+            // Lane L holds column L//4, rows [(L%4)*8 : +8]
+            // For channel c, lanes c*4 to c*4+3 hold the data
+            // k_slice = k_in_group / 8, k_in_slice = k_in_group % 8
+            const int k_slice = k_in_group / 8;
+            const int k_in_slice = k_in_group % 8;
+            const int lane = channel * 4 + k_slice;
+            const int byte_offset = lane * 4 + k_in_slice / 2;
+            const int nibble = k_in_slice % 2;
+            
+            const uint8_t packed = tile->tiles[group][byte_offset];
             
             int8_t val;
-            if (iq % 2 == 0) {
+            if (nibble == 0) {
                 val = (int8_t)(packed & 0x0F);
             } else {
                 val = (int8_t)((packed >> 4) & 0x0F);
@@ -338,7 +362,7 @@ void get_rows_cuda(
         const size_t s11 = nb11 / sizeof(int32_t);
         const size_t s12 = nb12 / sizeof(int32_t);
 
-        k_get_rows_tcq4_k32<float><<<block_nums, block_dims, 0, stream>>>(
+        k_get_rows_tcq4_tile<float><<<block_nums, block_dims, 0, stream>>>(
             src0_d, src1_d, (float*)dst_d,
             ne00, ne11, ne12,
             s1, s2, s3,

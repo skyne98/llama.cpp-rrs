@@ -305,25 +305,46 @@ typedef struct {
 } block_q4_K;
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2, "wrong q4_K block size/padding");
 
-// TCQ4-K32: Tensor Core native INT4 format
+// TCQ4-K32: Tensor Core native INT4 format for RRS W4A4
 // 256 weights = 8 groups × 32 elements, matching IMMA m16n8k32 K dimension
-// Weights stored in IMMA-friendly packed order (no runtime repack needed)
-// w = s_g * q + z_g, where s_g = S * qs[g], z_g = Z * qz[g]
-// Storage: 128 + 20 = 148 bytes / 256 weights = 4.625 bits/weight
-#define TCQ4_K32_BLOCK_SIZE 256
-#define TCQ4_K32_NUM_GROUPS 8
-#define TCQ4_K32_GROUP_SIZE 32
+// TCQ4 Tile Format - 8 output channels × 256 K elements in IMMA-native layout
+// Matches validated TCQ4Tile from rrs_validation/reference.py
+// Each tile is pre-packed for mma.sync.m16n8k32.s4.s4 tensor core execution
+// w = (S[c] * sc[c][g] / 127) * q + (Z[c] * zc[c][g] / 127)
+// Storage: 1184 bytes / 2048 weights = 4.625 bits/weight
+#define TCQ4_TILE_K         256     // K dimension per tile (8 groups × 32)
+#define TCQ4_TILE_CHANNELS  8       // Output channels per tile
+#define TCQ4_TILE_GROUPS    8       // K-groups per tile (32 elements each)
+#define TCQ4_TILE_GROUP_SIZE 32     // Elements per group (matches IMMA K=32)
+#define TCQ4_TILE_WEIGHTS   2048    // Total weights per tile (8 channels × 256 K)
+
 typedef struct {
-    // 256 signed int4 weights packed in IMMA tile order (8 int4 per uint32)
-    // Layout: ready for mma.sync.m16n8k32.s32.s4.s4.s32 without shuffle
-    uint8_t qs[TCQ4_K32_BLOCK_SIZE / 2];  // 128 bytes
-    // Double-quantized metadata (Q4_K-style)
-    ggml_half S;                           // scale-of-scales
-    ggml_half Z;                           // scale-of-zeros
-    int8_t sc[TCQ4_K32_NUM_GROUPS];        // per-group scale codes
-    int8_t zc[TCQ4_K32_NUM_GROUPS];        // per-group zero/offset codes
-} block_tcq4_k32;
-static_assert(sizeof(block_tcq4_k32) == TCQ4_K32_BLOCK_SIZE/2 + 2*sizeof(ggml_half) + 2*TCQ4_K32_NUM_GROUPS, "wrong tcq4_k32 block size/padding");
+    // 8 K-groups, each 128 bytes in IMMA B fragment order (1024 bytes total)
+    // tiles[g] contains 8 channels × 32 K elements for group g
+    // Packed so lane L loads bytes [L*4 : L*4+4] as uint32 directly for IMMA B operand
+    uint8_t tiles[TCQ4_TILE_GROUPS][128];
+
+    // Per-channel super-scales (16 bytes)
+    ggml_half S[TCQ4_TILE_CHANNELS];
+
+    // Per-channel super-zeros (16 bytes)
+    ggml_half Z[TCQ4_TILE_CHANNELS];
+
+    // Per-channel per-group scale codes (64 bytes)
+    // Actual scale = S[c] * sc[c][g] / 127
+    int8_t sc[TCQ4_TILE_CHANNELS][TCQ4_TILE_GROUPS];
+
+    // Per-channel per-group zero codes (64 bytes)
+    // Actual zero = Z[c] * zc[c][g] / 127
+    int8_t zc[TCQ4_TILE_CHANNELS][TCQ4_TILE_GROUPS];
+} block_tcq4_tile;
+static_assert(sizeof(block_tcq4_tile) == 1024 + 16 + 16 + 64 + 64, "wrong tcq4_tile size (expected 1184)");
+
+// Legacy alias for migration (TODO: remove after full migration)
+#define block_tcq4_k32 block_tcq4_tile
+#define TCQ4_K32_BLOCK_SIZE TCQ4_TILE_K
+#define TCQ4_K32_NUM_GROUPS TCQ4_TILE_GROUPS
+#define TCQ4_K32_GROUP_SIZE TCQ4_TILE_GROUP_SIZE
 
 // 5-bit quantization
 // 8 blocks of 32 elements each
