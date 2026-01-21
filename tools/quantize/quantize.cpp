@@ -122,11 +122,13 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 }
 
 // Derive TCQ4 channel permutations from imatrix data (RRS paper Section 3.2)
-// Sorts channels by activation magnitude (sum of squared activations) descending
-// This puts outlier channels first, which improves FWHT smoothing
+// Sorts channels by activation magnitude WITHIN each FWHT group of 256 elements.
+// This preserves the FWHT block structure while grouping outliers within each block.
 static void derive_tcq4_perms_from_imatrix(
         const std::unordered_map<std::string, std::vector<float>> & imatrix_data,
         std::unordered_map<std::string, std::vector<int32_t>> & perms) {
+    
+    constexpr int64_t FWHT_BLOCK_SIZE = 256;
     
     for (const auto & kv : imatrix_data) {
         const std::string & name = kv.first;
@@ -142,15 +144,24 @@ static void derive_tcq4_perms_from_imatrix(
             perm[i] = i;
         }
         
-        // Sort by imatrix value descending (high activation magnitude = outliers first)
-        std::sort(perm.begin(), perm.end(), [&values](int32_t a, int32_t b) {
-            return values[a] > values[b];
-        });
+        // Sort WITHIN each FWHT block of 256 elements
+        // This preserves inter-block structure while grouping outliers within each block
+        const int64_t num_blocks = (K + FWHT_BLOCK_SIZE - 1) / FWHT_BLOCK_SIZE;
+        for (int64_t b = 0; b < num_blocks; ++b) {
+            int64_t start = b * FWHT_BLOCK_SIZE;
+            int64_t end = std::min(start + FWHT_BLOCK_SIZE, K);
+            
+            // Sort this block by imatrix value descending
+            std::sort(perm.begin() + start, perm.begin() + end, 
+                [&values](int32_t a, int32_t b) {
+                    return values[a] > values[b];
+                });
+        }
         
         perms[name] = std::move(perm);
     }
     
-    printf("%s: derived %zu channel permutations from imatrix data\n", __func__, perms.size());
+    printf("%s: derived %zu channel permutations from imatrix data (per-block sorting)\n", __func__, perms.size());
 }
 
 [[noreturn]]
