@@ -298,25 +298,31 @@ void ggml_cuda_rrs_mul_mat(
     (void)n_tiles;
     
 #if TCQ4_USE_TENSOR_CORES
-    // Tensor core path: uses block_rrs_int4_tc with precomputed group sums
-    // Note: Fused GEMV kernel exists but is slower than IMMA due to scalar math.
-    // TODO: Implement fused IMMA GEMV that does FWHT in registers before tensor core ops.
-    size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4_tc);
-    size_t rrs_actual;
-    void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
-    
-    // Fused (permutation +) FWHT + Runtime Smooth + INT4 quantize
-    tcq4_rrs_perm_fwht_quantize_tc((const float*)src1->data, d_act_rrs, d_perm, K, M, stream);
-    
-    // Check for CUDA errors after activation quantization
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[TCQ4-RRS] CUDA error after activation quant: %s\n", cudaGetErrorString(err));
+    // Tensor core path
+    if (M == 1) {
+        // M=1: Use fused v2d kernel (2.8-3.6x faster than separate quant + IMMA)
+        // Fuses: permutation + FWHT + quantize + GEMV in single kernel
+        tcq4_rrs_fused_gemv((const float*)src1->data, d_perm, src0->data, 
+                           (float*)dst->data, N, K, stream);
+    } else {
+        // M>1: Use separate quantize + IMMA GEMM (tensor cores efficient for batched)
+        size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4_tc);
+        size_t rrs_actual;
+        void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
+        
+        // Fused (permutation +) FWHT + Runtime Smooth + INT4 quantize
+        tcq4_rrs_perm_fwht_quantize_tc((const float*)src1->data, d_act_rrs, d_perm, K, M, stream);
+        
+        // Check for CUDA errors after activation quantization
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[TCQ4-RRS] CUDA error after activation quant: %s\n", cudaGetErrorString(err));
+        }
+        
+        // Dispatch GEMM with tensor cores
+        tcq4_rrs_gemm_imma(d_act_rrs, src0->data, (float*)dst->data, M, N, K, stream);
     }
-    
-    // Dispatch GEMM with tensor cores (IMMA kernel works for all M, including M=1)
-    tcq4_rrs_gemm_imma(d_act_rrs, src0->data, (float*)dst->data, M, N, K, stream);
-#else
+#else /* !TCQ4_USE_TENSOR_CORES */
     // Scalar fallback path: uses block_rrs_int4 (simpler, no group sums)
     size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4);
     size_t rrs_actual;
