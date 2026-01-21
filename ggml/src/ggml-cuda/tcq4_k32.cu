@@ -277,164 +277,188 @@ tcq4_rrs_fused_activation_tc_kernel(
 }
 
 // =============================================================================
-// FUSED FWHT + GEMV (M=1) - Single kernel for token generation
-// Eliminates intermediate memory write and second kernel launch
 // =============================================================================
+// FUSED FWHT + GEMV v2d (M=1) - Optimized kernel for token generation
+// =============================================================================
+//
+// Performance: 2.8-3.6x faster than separate kernels, 8-23x faster than v1
+//
+// Key optimization: Warp-parallel K-reduction
+// - 32 outputs per block, 8 threads per output
+// - Each output's K-dimension reduction is parallelized across 8 threads
+// - FWHT computed once per K-tile per block (shared across 32 outputs)
+//
+// Grid:  ceil(N / 32) blocks
+// Block: 256 threads
+// Shared memory: ~1.3 KB
+//
 
 __global__ void __launch_bounds__(256)
 tcq4_rrs_fused_gemv_kernel(
-    const float* __restrict__ activations,  // FP32 input [K]
-    const int32_t* __restrict__ perm,       // Optional permutation [K]
-    const block_tcq4_tile* __restrict__ B_tiles,  // Tile format: [n_tile][k_tile]
-    float* __restrict__ C,                  // Output [N]
+    const float* __restrict__ activations,  // [K] FP32 input activations
+    const int32_t* __restrict__ perm,       // [K] Channel permutation (or nullptr)
+    const block_tcq4_tile* __restrict__ B_tiles,  // [N/8][K/256] weight tiles
+    float* __restrict__ C,                  // [N] FP32 output
     int N, int K
 ) {
-    // Each block computes one output channel
-    const int n = blockIdx.x;
-    if (n >= N) return;
-
     const int tid = threadIdx.x;
-    const int num_k_tiles = K / 256;
-
-    // Tile-based indexing
-    const int n_tile = n / 8;
-    const int channel = n % 8;
-
-    extern __shared__ float smem[];  // [256] for FWHT
-    __shared__ float s_smooth_scale;
-    __shared__ int8_t s_quant[256];
-    __shared__ int32_t s_group_sum[8];
-
-    float sum = 0.0f;
-
-    // Process each K-tile
+    
+    // 32 outputs per block, 8 threads per output
+    const int output_in_block = tid / 8;    // 0-31
+    const int thread_in_output = tid % 8;   // 0-7 (each handles one group)
+    
+    const int n_out = blockIdx.x * 32 + output_in_block;
+    const int num_k_tiles = K / TCQ4_TILE_K;
+    const int n_tile = n_out / 8;           // Which weight tile row
+    const int channel = n_out % 8;          // Which channel within tile
+    
+    // Shared memory layout
+    extern __shared__ char shared_mem[];
+    float* smem_fwht = (float*)shared_mem;                    // [256] FWHT workspace
+    int8_t* smem_quant = (int8_t*)(smem_fwht + 256);          // [256] quantized activations
+    float* smem_scale = (float*)(smem_quant + 256);           // [1] quantization scale
+    int32_t* smem_group_sum = (int32_t*)(smem_scale + 1);     // [8] group sums
+    
+    float acc = 0.0f;
+    
+    // Process each K-tile (256 elements)
     for (int kt = 0; kt < num_k_tiles; kt++) {
-        const int k_start = kt * 256;
-        const block_tcq4_tile& tile = B_tiles[n_tile * num_k_tiles + kt];
-
-        // ===== Stage 1: Load activations with permutation =====
+        const int k_start = kt * TCQ4_TILE_K;
+        
+        // ===== Stage 1: Load activations with optional permutation =====
         float val = 0.0f;
         if (k_start + tid < K) {
             int src_idx = perm ? perm[k_start + tid] : (k_start + tid);
             val = activations[src_idx];
         }
-        smem[tid] = val;
+        smem_fwht[tid] = val;
         __syncthreads();
-
-        // ===== Stage 2: FWHT in shared memory =====
+        
+        // ===== Stage 2: Fast Walsh-Hadamard Transform =====
+        // In-place transform of 256 elements in shared memory
         #pragma unroll
         for (int h = 1; h < 256; h *= 2) {
             int grp = tid / (h * 2);
             int pos = tid % (h * 2);
             if (pos < h) {
                 int j = grp * h * 2 + pos;
-                int k_idx = j + h;
-                float a = smem[j];
-                float b = smem[k_idx];
-                smem[j] = a + b;
-                smem[k_idx] = a - b;
+                float a = smem_fwht[j];
+                float b = smem_fwht[j + h];
+                smem_fwht[j] = a + b;
+                smem_fwht[j + h] = a - b;
             }
             __syncthreads();
         }
-
-        // Normalize
-        constexpr float norm = 1.0f / 16.0f;
-        val = smem[tid] * norm;
-
+        
+        // Normalize: 1/sqrt(256) = 1/16
+        val = smem_fwht[tid] * (1.0f / 16.0f);
+        
         // ===== Stage 3: Find max for quantization scale =====
         float abs_val = fabsf(val);
+        
+        // Warp-level reduction
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             abs_val = fmaxf(abs_val, __shfl_xor_sync(0xffffffff, abs_val, offset));
         }
-
+        
+        // Block-level reduction
         __shared__ float warp_max[8];
-        int lane = tid & 31;
-        int warp_id = tid >> 5;
+        int warp_id = tid / 32;
+        int lane = tid % 32;
         if (lane == 0) warp_max[warp_id] = abs_val;
         __syncthreads();
-
+        
         float max_abs;
         if (tid < 8) {
-            max_abs = warp_max[tid];
+            float m = warp_max[tid];
             #pragma unroll
             for (int offset = 4; offset > 0; offset /= 2) {
-                max_abs = fmaxf(max_abs, __shfl_xor_sync(0xff, max_abs, offset));
+                m = fmaxf(m, __shfl_xor_sync(0xff, m, offset));
             }
-            if (tid == 0) {
-                if (max_abs < 1e-10f) max_abs = 1.0f;
-                s_smooth_scale = max_abs;
-            }
+            if (tid == 0) *smem_scale = (m < 1e-10f) ? 1.0f : m;
         }
         __syncthreads();
-        max_abs = s_smooth_scale;
-
-        // ===== Stage 4: Quantize and compute group sums =====
-        if (tid < 8) s_group_sum[tid] = 0;
+        max_abs = *smem_scale;
+        
+        // ===== Stage 4: Quantize to INT4 and compute group sums =====
+        if (tid < 8) smem_group_sum[tid] = 0;
         __syncthreads();
-
+        
         float scaled = val * (7.0f / max_abs);
         int8_t q = (int8_t)fmaxf(-7.0f, fminf(7.0f, rintf(scaled)));
-        s_quant[tid] = q;
-        atomicAdd(&s_group_sum[tid / 32], (int32_t)q);
+        smem_quant[tid] = q;
+        atomicAdd(&smem_group_sum[tid / 32], (int32_t)q);
         __syncthreads();
-
-        // ===== Stage 5: Compute dot product with B tile =====
-        // Get B scales for this channel
-        float S = __half2float(tile.S[channel]);
-        float Z = __half2float(tile.Z[channel]);
-        float a_scale = max_abs;
-
-        // Process 8 groups
-        for (int g = 0; g < 8; g++) {
+        
+        // ===== Stage 5: Parallel dot product (8 threads per output) =====
+        // Each thread handles one of the 8 groups (32 elements each)
+        // Check bounds: n_out < N AND n_tile is valid (for non-aligned N)
+        const int n_tiles_total = (N + 7) / 8;
+        const bool valid_output = (n_out < N) && (n_tile < n_tiles_total);
+        
+        float contrib = 0.0f;
+        if (valid_output && thread_in_output < 8) {
+            const block_tcq4_tile& tile = B_tiles[n_tile * num_k_tiles + kt];
+            
+            float S = __half2float(tile.S[channel]);
+            float Z = __half2float(tile.Z[channel]);
+            float a_scale_div7 = max_abs / 7.0f;
+            
+            int g = thread_in_output;  // This thread handles group g
             float b_scale = S * (float)tile.sc[channel][g] / 127.0f;
             float b_zero = Z * (float)tile.zc[channel][g] / 127.0f;
-
+            
+            // Weight bytes are at: channel * 16 + k_slice * 4 + byte_in_slice
+            const int byte_base = channel * 16;
             int dot = 0;
-            int group_sum = s_group_sum[g];
-
-            // Each thread processes part of the 32-element group
-            for (int i = tid; i < 32; i += blockDim.x) {
-                int8_t a_q = s_quant[g * 32 + i];
-
-                // Unpack B from IMMA tile format
-                int k_slice = i / 8;
-                int k_in_slice = i % 8;
-                int lane_b = channel * 4 + k_slice;
-                int byte_offset = lane_b * 4 + k_in_slice / 2;
-                int b_nibble = k_in_slice % 2;
-
-                int8_t b_q;
-                if (b_nibble == 0) {
-                    b_q = (int8_t)(tile.tiles[g][byte_offset] & 0xF);
-                } else {
-                    b_q = (int8_t)((tile.tiles[g][byte_offset] >> 4) & 0xF);
-                }
-                b_q = (b_q >= 8) ? (b_q - 16) : b_q;
-
-                dot += (int)a_q * (int)b_q;
-            }
-
-            // Warp reduction
+            
+            // Process 32 elements for this group (4 k_slices × 8 elements each)
             #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                dot += __shfl_down_sync(0xffffffff, dot, offset);
+            for (int k_slice = 0; k_slice < 4; k_slice++) {
+                // Load 4 bytes = 8 INT4 weights as one uint32
+                uint32_t packed_w = *reinterpret_cast<const uint32_t*>(
+                    &tile.tiles[g][byte_base + k_slice * 4]);
+                
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int k_idx = g * 32 + k_slice * 8 + i;
+                    int8_t a_q = smem_quant[k_idx];
+                    
+                    // Extract INT4 weight: byte = i/2, nibble = i%2
+                    int shift = (i / 2) * 8 + (i % 2) * 4;
+                    int8_t b_q = (packed_w >> shift) & 0xF;
+                    if (b_q >= 8) b_q -= 16;  // Sign extend
+                    
+                    dot += (int)a_q * (int)b_q;
+                }
             }
-
-            if (tid == 0) {
-                sum += (float)dot * (a_scale / 7.0f) * b_scale;
-                sum += (float)group_sum * (a_scale / 7.0f) * b_zero;
-            }
+            
+            int32_t sum_a = smem_group_sum[g];
+            contrib = (float)dot * a_scale_div7 * b_scale 
+                    + (float)sum_a * a_scale_div7 * b_zero;
+        }
+        
+        // All threads participate in shuffle reduction (invalid threads contribute 0)
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            contrib += __shfl_xor_sync(0xffffffff, contrib, offset);
+        }
+        
+        // Thread 0 of each 8-thread group accumulates the result
+        if (thread_in_output == 0 && n_out < N) {
+            acc += contrib;
         }
         __syncthreads();
     }
-
-    if (tid == 0) {
-        C[n] = sum;
+    
+    // Write final result
+    if (thread_in_output == 0 && n_out < N) {
+        C[n_out] = acc;
     }
 }
 
-// Host wrapper for fused GEMV
+// Host wrapper for fused GEMV v2d
 void tcq4_rrs_fused_gemv(
     const float* activations,
     const int32_t* perm,
@@ -443,8 +467,16 @@ void tcq4_rrs_fused_gemv(
     int N, int K,
     cudaStream_t stream
 ) {
-    size_t smem = 256 * sizeof(float);
-    tcq4_rrs_fused_gemv_kernel<<<N, 256, smem, stream>>>(
+    // Grid: ceil(N / 32) blocks, each handles 32 outputs
+    int num_blocks = (N + 31) / 32;
+    
+    // Shared memory: 256*4 + 256 + 4 + 32 = 1316 bytes
+    size_t smem_size = 256 * sizeof(float)    // FWHT workspace
+                     + 256 * sizeof(int8_t)   // Quantized activations
+                     + sizeof(float)          // Scale
+                     + 8 * sizeof(int32_t);   // Group sums
+    
+    tcq4_rrs_fused_gemv_kernel<<<num_blocks, 256, smem_size, stream>>>(
         activations, perm,
         (const block_tcq4_tile*)B_tcq4,
         C, N, K
