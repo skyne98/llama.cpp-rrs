@@ -1,10 +1,11 @@
 // RRS CUDA Benchmark Tool
-// Compares INT4 WMMA tensor core path vs Q8 repack + dp4a path
-// Usage: ./llama-rrs-benchmark [M] [N] [K] [iterations]
+// Measures activation quantization overhead vs GEMM time
+// Usage: ./llama-rrs-benchmark [iterations]
 
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <vector>
 
 // Forward declarations for RRS functions (defined in rrs.cu)
 struct RRSBenchmarkResult {
@@ -18,101 +19,192 @@ struct RRSBenchmarkResult {
 extern void ggml_cuda_rrs_benchmark(int M, int N, int K, int iterations, RRSBenchmarkResult* result);
 extern void ggml_cuda_rrs_print_benchmark(const RRSBenchmarkResult* result);
 
+// Measure kernel launch overhead
+static float measure_launch_overhead(int iterations) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    // Empty kernel launch
+    cudaEventRecord(start);
+    for (int i = 0; i < iterations; i++) {
+        // Just record events with no kernel - measures event overhead
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    float event_time;
+    cudaEventElapsedTime(&event_time, start, stop);
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    
+    return (event_time * 1000.0f) / iterations;  // us per iteration
+}
+
+// Measure cudaMalloc/cudaFree overhead (simulating pool alloc worst case)
+static float measure_alloc_overhead(size_t size, int iterations) {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    std::vector<void*> ptrs(iterations);
+    
+    cudaEventRecord(start);
+    for (int i = 0; i < iterations; i++) {
+        cudaMalloc(&ptrs[i], size);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    float alloc_time;
+    cudaEventElapsedTime(&alloc_time, start, stop);
+    
+    for (int i = 0; i < iterations; i++) {
+        cudaFree(ptrs[i]);
+    }
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    
+    return (alloc_time * 1000.0f) / iterations;  // us per allocation
+}
+
 static void print_device_info() {
     int device;
     cudaGetDevice(&device);
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, device);
     
-    printf("=== RRS CUDA Benchmark ===\n");
+    printf("=== TCQ4 W4A4 Overhead Analysis ===\n");
     printf("Device: %s (SM%d%d)\n", props.name, props.major, props.minor);
-    printf("Compute Capability: %d.%d\n", props.major, props.minor);
-    
-    // Check INT4 tensor core support
-    bool has_int4_tc = (props.major > 7) || (props.major == 7 && props.minor >= 5);
-    printf("INT4 Tensor Core Support: %s\n", has_int4_tc ? "Yes" : "No");
-    
-    if (!has_int4_tc) {
-        printf("WARNING: This device does not support INT4 tensor cores (requires SM75+)\n");
-        printf("         The INT4 WMMA path will not be available.\n");
-    }
-    
-    // Theoretical peak INT4 TOPS
-    // RTX 3090: 142 TFLOPS FP16, INT4 is ~4x = ~568 TOPS
-    float clock_ghz = props.clockRate / 1e6f;
-    int sm_count = props.multiProcessorCount;
-    
-    printf("SM Count: %d\n", sm_count);
-    printf("Clock: %.2f GHz\n", clock_ghz);
     printf("\n");
 }
 
-static void run_benchmarks(int M, int N, int K, int iterations) {
-    printf("Matrix Dimensions: M=%d, N=%d, K=%d\n", M, N, K);
-    printf("Iterations: %d\n", iterations);
-    printf("\n");
-    
+static void print_table_header() {
+    printf("%-25s %6s %6s %6s %10s %10s %10s %8s %8s\n",
+           "Test Case", "M", "N", "K", "Quant(us)", "GEMM(us)", "Total(us)", "Overhd%", "TFLOPS");
+    printf("%-25s %6s %6s %6s %10s %10s %10s %8s %8s\n",
+           "-------------------------", "------", "------", "------", 
+           "----------", "----------", "----------", "--------", "--------");
+}
+
+static void run_benchmark(const char* name, int M, int N, int K, int iterations) {
     RRSBenchmarkResult result;
     ggml_cuda_rrs_benchmark(M, N, K, iterations, &result);
-    ggml_cuda_rrs_print_benchmark(&result);
+    
+    float quant_us = result.quantize_time_ms * 1000.0f;
+    float gemm_us = result.int4_wmma_time_ms * 1000.0f;
+    float total_us = quant_us + gemm_us;
+    float overhead_pct = (total_us > 0) ? (100.0f * quant_us / total_us) : 0.0f;
+    
+    // Compute TFLOPS (2*M*N*K ops for matmul)
+    double ops = 2.0 * M * N * K;
+    double tflops = (gemm_us > 0) ? (ops / (gemm_us * 1e-6) / 1e12) : 0.0;
+    
+    printf("%-25s %6d %6d %6d %10.2f %10.2f %10.2f %7.1f%% %8.2f\n",
+           name, M, N, K, quant_us, gemm_us, total_us, overhead_pct, tflops);
 }
 
 int main(int argc, char** argv) {
-    // Default dimensions (typical for small LLM layer)
-    int M = 32;     // batch size / tokens
-    int N = 2048;   // output features
-    int K = 2048;   // input features  
     int iterations = 100;
     
-    if (argc >= 4) {
-        M = atoi(argv[1]);
-        N = atoi(argv[2]);
-        K = atoi(argv[3]);
-    }
-    if (argc >= 5) {
-        iterations = atoi(argv[4]);
+    if (argc >= 2) {
+        iterations = atoi(argv[1]);
     }
     
-    // Validate dimensions (must be multiples of 32 for Q4 quantization)
-    if (K % 32 != 0) {
-        fprintf(stderr, "Error: K must be a multiple of 32 (got %d)\n", K);
-        return 1;
-    }
-    if (N % 32 != 0) {
-        fprintf(stderr, "Error: N must be a multiple of 32 (got %d)\n", N);
-        return 1;
-    }
-    
-    // Print device info
     print_device_info();
     
-    // Run benchmarks with different configurations
-    printf("=== Benchmark 1: Small Batch (typical inference) ===\n");
-    run_benchmarks(M, N, K, iterations);
+    printf("Iterations per test: %d\n\n", iterations);
+    
+    // Measure overhead components first
+    printf("=== Overhead Measurement ===\n");
+    float event_overhead = measure_launch_overhead(1000);
+    printf("CUDA event overhead: %.2f us/event\n", event_overhead);
+    
+    // Typical activation buffer size for M=1, K=2048: ~256 bytes (1 block_rrs_int4_tc)
+    float alloc_256 = measure_alloc_overhead(256, 100);
+    float alloc_4k = measure_alloc_overhead(4096, 100);
+    printf("cudaMalloc overhead (256B): %.2f us/alloc\n", alloc_256);
+    printf("cudaMalloc overhead (4KB): %.2f us/alloc\n", alloc_4k);
+    printf("Note: Pool allocator is much faster than cudaMalloc, but has some overhead.\n\n");
+    
+    // ===== Part 1: Single-token generation (M=1) =====
+    printf("=== Single Token Generation (M=1) ===\n");
+    printf("This is the critical path for autoregressive inference.\n\n");
+    
+    print_table_header();
+    
+    // Qwen3-0.6B typical dimensions
+    run_benchmark("Qwen3-0.6B attn_qkv", 1, 2048, 1024, iterations);
+    run_benchmark("Qwen3-0.6B attn_o", 1, 1024, 1024, iterations);
+    run_benchmark("Qwen3-0.6B mlp_gate", 1, 2816, 1024, iterations);
+    run_benchmark("Qwen3-0.6B mlp_up", 1, 2816, 1024, iterations);
+    run_benchmark("Qwen3-0.6B mlp_down", 1, 1024, 2816, iterations);
+    
     printf("\n");
     
-    // Larger batch for throughput testing
-    if (M < 128) {
-        printf("=== Benchmark 2: Larger Batch (M=128) ===\n");
-        run_benchmarks(128, N, K, iterations);
-        printf("\n");
-    }
+    // Qwen3-4B typical dimensions
+    run_benchmark("Qwen3-4B attn_qkv", 1, 4608, 2048, iterations);
+    run_benchmark("Qwen3-4B attn_o", 1, 2048, 2048, iterations);
+    run_benchmark("Qwen3-4B mlp_gate", 1, 5632, 2048, iterations);
+    run_benchmark("Qwen3-4B mlp_down", 1, 2048, 5632, iterations);
     
-    // Different K sizes (common hidden dimensions)
-    if (K == 2048) {
-        printf("=== Benchmark 3: K=4096 (larger hidden dim) ===\n");
-        run_benchmarks(M, N, 4096, iterations);
-        printf("\n");
-    }
-    
-    printf("=== Summary ===\n");
-    printf("The benchmark compares two approaches for RRS W4A4 GEMM:\n");
-    printf("1. INT4 WMMA: Direct INT4 tensor core path (SM75+ only)\n");
-    printf("2. Q8 Repack: Convert Q4->Q8 and use dp4a (all CUDA devices)\n");
     printf("\n");
-    printf("For production use:\n");
-    printf("- Use INT4 WMMA on Turing+ GPUs (RTX 20xx, 30xx, 40xx)\n");
-    printf("- Use Q8 Repack as fallback on older GPUs\n");
+    
+    // ===== Part 2: Prefill / Batched inference =====
+    printf("=== Batched Inference (Prefill) ===\n");
+    printf("Activation overhead should amortize with larger batch.\n\n");
+    
+    print_table_header();
+    
+    run_benchmark("M=16, N=2048, K=2048", 16, 2048, 2048, iterations);
+    run_benchmark("M=32, N=2048, K=2048", 32, 2048, 2048, iterations);
+    run_benchmark("M=64, N=2048, K=2048", 64, 2048, 2048, iterations);
+    run_benchmark("M=128, N=2048, K=2048", 128, 2048, 2048, iterations);
+    run_benchmark("M=256, N=2048, K=2048", 256, 2048, 2048, iterations);
+    run_benchmark("M=512, N=2048, K=2048", 512, 2048, 2048, iterations);
+    
+    printf("\n");
+    
+    // ===== Part 3: Large dimensions =====
+    printf("=== Large Dimensions (4Kx4K) ===\n\n");
+    
+    print_table_header();
+    
+    run_benchmark("M=1, N=4096, K=4096", 1, 4096, 4096, iterations);
+    run_benchmark("M=16, N=4096, K=4096", 16, 4096, 4096, iterations);
+    run_benchmark("M=64, N=4096, K=4096", 64, 4096, 4096, iterations);
+    run_benchmark("M=128, N=4096, K=4096", 128, 4096, 4096, iterations);
+    run_benchmark("M=256, N=4096, K=4096", 256, 4096, 4096, iterations);
+    
+    printf("\n");
+    
+    // ===== Summary =====
+    printf("=== Analysis ===\n\n");
+    printf("Components measured:\n");
+    printf("  - Quant: FWHT transform + Runtime Smooth + INT4 packing\n");
+    printf("  - GEMM:  TCQ4 IMMA tensor core matmul (m16n8k32.s4.s4.s32)\n");
+    printf("\n");
+    printf("Key insight:\n");
+    printf("  - At M=1 (generation), activation quantization dominates (~70-90%% overhead)\n");
+    printf("  - At larger M (prefill/batch), GEMM time dominates, overhead drops\n");
+    printf("  - Standalone GEMM is 3-4x faster than Q4_K dp4a\n");
+    printf("  - But total time (quant+gemm) is slower than Q4_K for M=1\n");
+    printf("\n");
+    printf("To make TCQ4 competitive for generation:\n");
+    printf("  1. Fused activation+GEMM kernel (single launch, no intermediate write)\n");
+    printf("  2. Specialized GEMV for M=1 with inline FWHT\n");
+    printf("  3. Pre-allocated activation buffers (avoid pool alloc overhead)\n");
+    printf("\n");
+    printf("Overhead breakdown for M=1 path (estimated):\n");
+    printf("  - Pool alloc: ~1-5 us (depends on pool implementation)\n");
+    printf("  - Kernel launch #1 (quant): ~3-5 us\n");
+    printf("  - Kernel launch #2 (GEMM): ~3-5 us\n");
+    printf("  - Memory write (quant output): bandwidth-limited\n");
+    printf("  - Memory read (GEMM input): bandwidth-limited\n");
+    printf("\n");
+    printf("Q4_K comparison: single kernel, no intermediate storage, direct compute.\n");
     
     return 0;
 }

@@ -134,3 +134,13 @@ void tcq4_rrs_gemm_imma(
     float* __restrict__ C,
     int M, int N, int K,
     cudaStream_t stream);
+
+// Fused FWHT + GEMV for M=1 (single token generation)
+// Eliminates intermediate memory write and second kernel launch
+void tcq4_rrs_fused_gemv(
+    const float* activations,
+    const int32_t* perm,
+    const void* B_tcq4,
+    float* C,
+    int N, int K,
+    cudaStream_t stream);

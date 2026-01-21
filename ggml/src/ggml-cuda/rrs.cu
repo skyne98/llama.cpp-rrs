@@ -269,19 +269,38 @@ void ggml_cuda_rrs_mul_mat(
         d_perm = ggml_cuda_rrs_get_perm(src0->name);
     }
     
-    // Debug output (disabled for production - set to 1 to enable)
+    // Call counting (set TCQ4_COUNT=1 env var to enable)
+    static bool count_enabled = (getenv("TCQ4_COUNT") != nullptr);
     static int call_count = 0;
+    static int token_count = 0;
+    static int last_M = -1;
+    
+    if (count_enabled) {
+        call_count++;
+        // Detect new token: M changes or we see M=1 after M>1
+        if (M != last_M && (last_M > 1 || last_M == -1)) {
+            if (token_count > 0) {
+                fprintf(stderr, "[TCQ4-COUNT] Token %d: %d mul_mat calls\n", token_count, call_count - 1);
+            }
+            token_count++;
+            call_count = 1;
+        }
+        last_M = M;
+    }
+    
+    // Debug output (disabled for production - set to 1 to enable)
     static bool first_call = true;
     if (first_call) {
-        fprintf(stderr, "[TCQ4-RRS-W4A4] mul_mat M=%d N=%d K=%d perm=%s\n",
-                M, N, K, d_perm ? "yes" : "no");
+        fprintf(stderr, "[TCQ4-RRS-W4A4] mul_mat M=%d N=%d K=%d perm=%s count=%s\n",
+                M, N, K, d_perm ? "yes" : "no", count_enabled ? "ON" : "off");
         first_call = false;
     }
-    (void)call_count;
     (void)n_tiles;
     
 #if TCQ4_USE_TENSOR_CORES
     // Tensor core path: uses block_rrs_int4_tc with precomputed group sums
+    // Note: Fused GEMV kernel exists but is slower than IMMA due to scalar math.
+    // TODO: Implement fused IMMA GEMV that does FWHT in registers before tensor core ops.
     size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4_tc);
     size_t rrs_actual;
     void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
@@ -296,10 +315,7 @@ void ggml_cuda_rrs_mul_mat(
     }
     
     // Dispatch GEMM with tensor cores (IMMA kernel works for all M, including M=1)
-    // Note: The scalar GEMV kernel (tcq4_rrs_gemv_tc) is ~3x slower than IMMA for M=1
     tcq4_rrs_gemm_imma(d_act_rrs, src0->data, (float*)dst->data, M, N, K, stream);
-    
-
 #else
     // Scalar fallback path: uses block_rrs_int4 (simpler, no group sums)
     size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4);

@@ -277,7 +277,182 @@ tcq4_rrs_fused_activation_tc_kernel(
 }
 
 // =============================================================================
-// RRS GEMV (M=1) - Scalar path for token generation
+// FUSED FWHT + GEMV (M=1) - Single kernel for token generation
+// Eliminates intermediate memory write and second kernel launch
+// =============================================================================
+
+__global__ void __launch_bounds__(256)
+tcq4_rrs_fused_gemv_kernel(
+    const float* __restrict__ activations,  // FP32 input [K]
+    const int32_t* __restrict__ perm,       // Optional permutation [K]
+    const block_tcq4_tile* __restrict__ B_tiles,  // Tile format: [n_tile][k_tile]
+    float* __restrict__ C,                  // Output [N]
+    int N, int K
+) {
+    // Each block computes one output channel
+    const int n = blockIdx.x;
+    if (n >= N) return;
+
+    const int tid = threadIdx.x;
+    const int num_k_tiles = K / 256;
+
+    // Tile-based indexing
+    const int n_tile = n / 8;
+    const int channel = n % 8;
+
+    extern __shared__ float smem[];  // [256] for FWHT
+    __shared__ float s_smooth_scale;
+    __shared__ int8_t s_quant[256];
+    __shared__ int32_t s_group_sum[8];
+
+    float sum = 0.0f;
+
+    // Process each K-tile
+    for (int kt = 0; kt < num_k_tiles; kt++) {
+        const int k_start = kt * 256;
+        const block_tcq4_tile& tile = B_tiles[n_tile * num_k_tiles + kt];
+
+        // ===== Stage 1: Load activations with permutation =====
+        float val = 0.0f;
+        if (k_start + tid < K) {
+            int src_idx = perm ? perm[k_start + tid] : (k_start + tid);
+            val = activations[src_idx];
+        }
+        smem[tid] = val;
+        __syncthreads();
+
+        // ===== Stage 2: FWHT in shared memory =====
+        #pragma unroll
+        for (int h = 1; h < 256; h *= 2) {
+            int grp = tid / (h * 2);
+            int pos = tid % (h * 2);
+            if (pos < h) {
+                int j = grp * h * 2 + pos;
+                int k_idx = j + h;
+                float a = smem[j];
+                float b = smem[k_idx];
+                smem[j] = a + b;
+                smem[k_idx] = a - b;
+            }
+            __syncthreads();
+        }
+
+        // Normalize
+        constexpr float norm = 1.0f / 16.0f;
+        val = smem[tid] * norm;
+
+        // ===== Stage 3: Find max for quantization scale =====
+        float abs_val = fabsf(val);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            abs_val = fmaxf(abs_val, __shfl_xor_sync(0xffffffff, abs_val, offset));
+        }
+
+        __shared__ float warp_max[8];
+        int lane = tid & 31;
+        int warp_id = tid >> 5;
+        if (lane == 0) warp_max[warp_id] = abs_val;
+        __syncthreads();
+
+        float max_abs;
+        if (tid < 8) {
+            max_abs = warp_max[tid];
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) {
+                max_abs = fmaxf(max_abs, __shfl_xor_sync(0xff, max_abs, offset));
+            }
+            if (tid == 0) {
+                if (max_abs < 1e-10f) max_abs = 1.0f;
+                s_smooth_scale = max_abs;
+            }
+        }
+        __syncthreads();
+        max_abs = s_smooth_scale;
+
+        // ===== Stage 4: Quantize and compute group sums =====
+        if (tid < 8) s_group_sum[tid] = 0;
+        __syncthreads();
+
+        float scaled = val * (7.0f / max_abs);
+        int8_t q = (int8_t)fmaxf(-7.0f, fminf(7.0f, rintf(scaled)));
+        s_quant[tid] = q;
+        atomicAdd(&s_group_sum[tid / 32], (int32_t)q);
+        __syncthreads();
+
+        // ===== Stage 5: Compute dot product with B tile =====
+        // Get B scales for this channel
+        float S = __half2float(tile.S[channel]);
+        float Z = __half2float(tile.Z[channel]);
+        float a_scale = max_abs;
+
+        // Process 8 groups
+        for (int g = 0; g < 8; g++) {
+            float b_scale = S * (float)tile.sc[channel][g] / 127.0f;
+            float b_zero = Z * (float)tile.zc[channel][g] / 127.0f;
+
+            int dot = 0;
+            int group_sum = s_group_sum[g];
+
+            // Each thread processes part of the 32-element group
+            for (int i = tid; i < 32; i += blockDim.x) {
+                int8_t a_q = s_quant[g * 32 + i];
+
+                // Unpack B from IMMA tile format
+                int k_slice = i / 8;
+                int k_in_slice = i % 8;
+                int lane_b = channel * 4 + k_slice;
+                int byte_offset = lane_b * 4 + k_in_slice / 2;
+                int b_nibble = k_in_slice % 2;
+
+                int8_t b_q;
+                if (b_nibble == 0) {
+                    b_q = (int8_t)(tile.tiles[g][byte_offset] & 0xF);
+                } else {
+                    b_q = (int8_t)((tile.tiles[g][byte_offset] >> 4) & 0xF);
+                }
+                b_q = (b_q >= 8) ? (b_q - 16) : b_q;
+
+                dot += (int)a_q * (int)b_q;
+            }
+
+            // Warp reduction
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                dot += __shfl_down_sync(0xffffffff, dot, offset);
+            }
+
+            if (tid == 0) {
+                sum += (float)dot * (a_scale / 7.0f) * b_scale;
+                sum += (float)group_sum * (a_scale / 7.0f) * b_zero;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[n] = sum;
+    }
+}
+
+// Host wrapper for fused GEMV
+void tcq4_rrs_fused_gemv(
+    const float* activations,
+    const int32_t* perm,
+    const void* B_tcq4,
+    float* C,
+    int N, int K,
+    cudaStream_t stream
+) {
+    size_t smem = 256 * sizeof(float);
+    tcq4_rrs_fused_gemv_kernel<<<N, 256, smem, stream>>>(
+        activations, perm,
+        (const block_tcq4_tile*)B_tcq4,
+        C, N, K
+    );
+}
+
+// =============================================================================
+// RRS GEMV (M=1) - Scalar path for token generation (OLD - kept for reference)
 // dp4a is more efficient than IMMA for single-row operations
 // =============================================================================
 

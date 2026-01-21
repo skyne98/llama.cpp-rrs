@@ -1,9 +1,10 @@
-# RRS CUDA Benchmark - disabled due to build complexity
-# The benchmark functionality is available directly in rrs.cu via:
-# - ggml_cuda_rrs_benchmark()
-# - ggml_cuda_rrs_print_benchmark()
+set(TARGET llama-rrs-benchmark)
 
-# To benchmark RRS CUDA performance, call these functions from
-# an existing CUDA-enabled test or add a test in the ggml-cuda tests.
-
-message(STATUS "RRS benchmark example skipped (use ggml_cuda_rrs_benchmark() directly)")
+if (GGML_CUDA)
+    enable_language(CUDA)
+    add_executable(${TARGET} main.cu)
+    target_link_libraries(${TARGET} PRIVATE ggml)
+    install(TARGETS ${TARGET} RUNTIME)
+else()
+    message(STATUS "RRS benchmark skipped (requires GGML_CUDA=ON)")
+endif()
