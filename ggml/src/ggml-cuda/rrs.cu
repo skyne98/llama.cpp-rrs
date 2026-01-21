@@ -315,30 +315,12 @@ void ggml_cuda_rrs_mul_mat(
     (void)n_tiles;
     
 #if TCQ4_USE_TENSOR_CORES
-    // Tensor core path
-    if (tcq4_should_use_fused_smallM(M)) {
-        // Small M (1-16): Use fused kernel (2.8-3.6x faster than separate quant + IMMA)
-        // Fuses: permutation + FWHT + quantize + GEMM in single kernel
-        tcq4_rrs_fused_gemm_smallM((const float*)src1->data, d_perm, src0->data, 
-                                   (float*)dst->data, M, N, K, stream);
-    } else {
-        // M>16: Use separate quantize + IMMA GEMM (tensor cores efficient for larger batches)
-        size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4_tc);
-        size_t rrs_actual;
-        void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);
-        
-        // Fused (permutation +) FWHT + Runtime Smooth + INT4 quantize
-        tcq4_rrs_perm_fwht_quantize_tc((const float*)src1->data, d_act_rrs, d_perm, K, M, stream);
-        
-        // Check for CUDA errors after activation quantization
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[TCQ4-RRS] CUDA error after activation quant: %s\n", cudaGetErrorString(err));
-        }
-        
-        // Dispatch GEMM with tensor cores
-        tcq4_rrs_gemm_imma(d_act_rrs, src0->data, (float*)dst->data, M, N, K, stream);
-    }
+    // Fused kernel path for all M values
+    // Fuses: permutation + FWHT + quantize + GEMM in single kernel
+    // Eliminates intermediate memory write and second kernel launch
+    tcq4_rrs_fused_gemm_smallM((const float*)src1->data, d_perm, src0->data, 
+                               (float*)dst->data, M, N, K, stream);
+    (void)num_k_tiles;  // Suppress unused warning
 #else /* !TCQ4_USE_TENSOR_CORES */
     // Scalar fallback path: uses block_rrs_int4 (simpler, no group sums)
     size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4);
