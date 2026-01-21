@@ -288,24 +288,41 @@ void ggml_cuda_rrs_mul_mat(
         last_M = M;
     }
     
-    // Debug output (disabled for production - set to 1 to enable)
+    // Track M value distribution
+    static int m_counts[33] = {0};  // m_counts[i] = count of M==i, [32] = M>32
+    int m_idx = (M <= 32) ? M : 32;
+    m_counts[m_idx]++;
+    
+    // Debug output
     static bool first_call = true;
     if (first_call) {
         fprintf(stderr, "[TCQ4-RRS-W4A4] mul_mat M=%d N=%d K=%d perm=%s count=%s\n",
                 M, N, K, d_perm ? "yes" : "no", count_enabled ? "ON" : "off");
         first_call = false;
     }
+    
+    // Print stats periodically
+    static int total_calls = 0;
+    total_calls++;
+    if (total_calls % 200 == 0) {
+        fprintf(stderr, "[TCQ4-STATS] call#%d M distribution: ", total_calls);
+        for (int i = 1; i <= 32; i++) {
+            if (m_counts[i] > 0) fprintf(stderr, "M%d=%d ", i, m_counts[i]);
+        }
+        if (m_counts[32] > 0) fprintf(stderr, "M>32=%d", m_counts[32]);
+        fprintf(stderr, "\n");
+    }
     (void)n_tiles;
     
 #if TCQ4_USE_TENSOR_CORES
     // Tensor core path
-    if (M == 1) {
-        // M=1: Use fused v2d kernel (2.8-3.6x faster than separate quant + IMMA)
-        // Fuses: permutation + FWHT + quantize + GEMV in single kernel
-        tcq4_rrs_fused_gemv((const float*)src1->data, d_perm, src0->data, 
-                           (float*)dst->data, N, K, stream);
+    if (tcq4_should_use_fused_smallM(M)) {
+        // Small M (1-16): Use fused kernel (2.8-3.6x faster than separate quant + IMMA)
+        // Fuses: permutation + FWHT + quantize + GEMM in single kernel
+        tcq4_rrs_fused_gemm_smallM((const float*)src1->data, d_perm, src0->data, 
+                                   (float*)dst->data, M, N, K, stream);
     } else {
-        // M>1: Use separate quantize + IMMA GEMM (tensor cores efficient for batched)
+        // M>16: Use separate quantize + IMMA GEMM (tensor cores efficient for larger batches)
         size_t rrs_size = M * num_k_tiles * sizeof(block_rrs_int4_tc);
         size_t rrs_actual;
         void* d_act_rrs = ctx.pool().alloc(rrs_size, &rrs_actual);

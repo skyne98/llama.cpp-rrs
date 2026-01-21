@@ -144,3 +144,21 @@ void tcq4_rrs_fused_gemv(
     float* C,
     int N, int K,
     cudaStream_t stream);
+
+// Fused FWHT + GEMM for small M (1-16)
+// Extends v2d speedups to small batch/prompt processing
+void tcq4_rrs_fused_gemm_smallM(
+    const float* activations,
+    const int32_t* perm,
+    const void* B_tcq4,
+    float* C,
+    int M, int N, int K,
+    cudaStream_t stream);
+
+// Max M for which fused small-M kernel is used
+constexpr int TCQ4_FUSED_SMALLM_MAX = 16;
+
+// Check if fused small-M kernel should be used
+inline bool tcq4_should_use_fused_smallM(int M) {
+    return M >= 1 && M <= TCQ4_FUSED_SMALLM_MAX;
+}
