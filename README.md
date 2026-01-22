@@ -4,7 +4,7 @@
 
 ## RRS/TCQ4 Quantization (Experimental)
 
-This fork adds **TCQ4_K32** - a W4A4 (4-bit weights, 4-bit activations) quantization format using:
+This fork adds **TCQ4_K32** - a W4A4 (4-bit weights, 4-bit activations) quantization format based on the [RRS paper](https://www.alphaxiv.org/abs/2409.20361):
 - **RRS (Rotated Runtime Smooth)**: FWHT-based activation smoothing
 - **Tensor Core acceleration**: INT4×INT4 IMMA on SM75+ GPUs (Turing/Ampere/Ada)
 - **Channel reordering**: Importance-based sorting within FWHT blocks for better quality
