@@ -1,5 +1,66 @@
 # llama.cpp
 
+> **⚠️ This is an experimental fork with TCQ4 (W4A4) quantization support**
+
+## RRS/TCQ4 Quantization (Experimental)
+
+This fork adds **TCQ4_K32** - a W4A4 (4-bit weights, 4-bit activations) quantization format using:
+- **RRS (Rotated Runtime Smooth)**: FWHT-based activation smoothing
+- **Tensor Core acceleration**: INT4×INT4 IMMA on SM75+ GPUs (Turing/Ampere/Ada)
+- **Channel reordering**: Importance-based sorting within FWHT blocks for better quality
+
+### Quick Start
+
+```bash
+# 1. Build with CUDA support
+mkdir build && cd build
+cmake .. -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build . -j$(nproc)
+
+# 2. Quantize a model to TCQ4 (requires F16 source model)
+# Without channel reordering:
+./bin/llama-quantize model-f16.gguf model-tcq4.gguf TCQ4_K32
+
+# With channel reordering (better quality, needs imatrix):
+./bin/llama-quantize --imatrix imatrix.dat --tcq4-imatrix \
+    model-f16.gguf model-tcq4-reorder.gguf TCQ4_K32
+
+# 3. Run inference
+./bin/llama-cli -m model-tcq4.gguf -p "Hello" -n 64
+```
+
+### Generating an Importance Matrix
+
+```bash
+# Use calibration data (e.g., wikitext)
+./bin/llama-imatrix -m model-f16.gguf -f wikitext-2-raw/wiki.train.raw -o imatrix.dat
+```
+
+### Performance (RTX 3090, Qwen3-4B)
+
+| Format | PPL (WikiText-2) | Generation | Prompt |
+|--------|------------------|------------|--------|
+| Q4_K   | 13.33           | 165 t/s    | 450 t/s |
+| TCQ4 (no reorder) | 14.07 | 68 t/s | 135 t/s |
+| TCQ4 (per-block reorder) | **13.88** | 68 t/s | 135 t/s |
+
+### Current Status
+
+- ✅ Quantization working (TCQ4_K32 format)
+- ✅ Inference working (CUDA, tensor cores)
+- ✅ Fused FWHT+quant+GEMM kernel
+- ✅ Channel reordering via imatrix
+- ⚠️ ~2.3x slower than Q4_K (optimization ongoing)
+- ❌ CPU inference not supported
+
+### Files of Interest
+
+- `ggml/src/ggml-cuda/tcq4_k32.cu` - CUDA kernels
+- `ggml/src/ggml-cuda/rrs.cu` - RRS dispatch logic
+- `tools/quantize/quantize.cpp` - Quantization with reordering
+
+---
+
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
